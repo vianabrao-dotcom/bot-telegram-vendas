@@ -1,34 +1,84 @@
 import os
+import requests
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
 
+# ===============================
+# FUNÇÃO PIX MERCADO PAGO
+# ===============================
+def gerar_pix(valor):
+    url = "https://api.mercadopago.com/v1/payments"
+    headers = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    data = {
+        "transaction_amount": valor,
+        "description": "Assinatura VIP",
+        "payment_method_id": "pix",
+        "payer": {
+            "email": "cliente@email.com"
+        }
+    }
+
+    response = requests.post(url, headers=headers, json=data)
+    return response.json()
+
+# ===============================
+# START
+# ===============================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔥 Bem-vindo!\n\n"
-        "Escolha seu plano digitando o número:\n\n"
-        "1️⃣ Plano Semanal — R$19,90\n"
-        "2️⃣ Plano Mensal — R$29,90\n"
-        "3️⃣ Plano Anual — R$39,90\n\n"
-        "🔥 OFERTA ESPECIAL 🔥\n"
-        "4️⃣ Plano Anual — R$29,99"
+        "🔥 *BEM-VINDO AO PRIME VIP* 🔥\n\n"
+        "Escolha um plano digitando o número:\n\n"
+        "1️⃣ Plano Semanal – R$10,90\n"
+        "2️⃣ Plano Mensal – R$15,90\n"
+        "3️⃣ Plano Anual – R$19,90\n",
+        parse_mode="Markdown"
     )
 
+# ===============================
+# MENSAGENS
+# ===============================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "⏳ Em breve vou gerar seu Pix automaticamente.\n"
-        "Aguarde a próxima etapa."
-    )
+    texto = update.message.text
 
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN não encontrado")
+    if texto == "1":
+        valor = 10.90
+    elif texto == "2":
+        valor = 15.90
+    elif texto == "3":
+        valor = 19.90
+    else:
+        await update.message.reply_text("❌ Opção inválida.")
+        return
 
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling()
+    pagamento = gerar_pix(valor)
 
-if __name__ == "__main__":
-    main()
+    try:
+        qr = pagamento["point_of_interaction"]["transaction_data"]["qr_code"]
+        qr_img = pagamento["point_of_interaction"]["transaction_data"]["qr_code_base64"]
+
+        await update.message.reply_text(
+            f"💳 *PIX GERADO COM SUCESSO*\n\n"
+            f"💰 Valor: R${valor}\n\n"
+            f"📋 *Copie e cole este código Pix:* 👇\n\n"
+            f"`{qr}`\n\n"
+            f"⏳ Após o pagamento, aguarde a liberação automática.",
+            parse_mode="Markdown"
+        )
+
+    except:
+        await update.message.reply_text("❌ Erro ao gerar Pix. Tente novamente.")
+
+# ===============================
+# APP
+# ===============================
+app = ApplicationBuilder().token(BOT_TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+app.run_polling()
