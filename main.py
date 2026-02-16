@@ -133,7 +133,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Email "fake" para o payer (Mercado Pago exige email).
     # Você pode trocar por um email real se quiser.
     user = update.effective_user
-    payer_email = f"{user.id}@telegram.local"
+    payer_email = f"user{user.id}@gmail.com"
 
     await update.message.reply_text("⏳ Gerando seu PIX...")
 
