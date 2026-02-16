@@ -49,36 +49,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===============================
 # MENSAGENS
 # ===============================
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    texto = update.message.text
+async def handle_message(status, pagamento = gerar_pix(valor)
 
-    if texto == "1":
-        valor = 10.90
-    elif texto == "2":
-        valor = 15.90
-    elif texto == "3":
-        valor = 19.90
-    else:
-        await update.message.reply_text("❌ Opção inválida.")
-        return
+if status not in (200, 201):
+    await update.message.reply_text(
+        "❌ Erro ao gerar Pix.\n\n"
+        f"Status: {status}\n"
+        f"Resposta: {pagamento}"
+    )
+    return
 
-    pagamento = gerar_pix(valor)
+try:
+    tx = pagamento["point_of_interaction"]["transaction_data"]
+    qr_copia_cola = tx["qr_code"]
 
-    try:
-        qr = pagamento["point_of_interaction"]["transaction_data"]["qr_code"]
-        qr_img = pagamento["point_of_interaction"]["transaction_data"]["qr_code_base64"]
-
-        await update.message.reply_text(
-            f"💳 *PIX GERADO COM SUCESSO*\n\n"
-            f"💰 Valor: R${valor}\n\n"
-            f"📋 *Copie e cole este código Pix:* 👇\n\n"
-            f"`{qr}`\n\n"
-            f"⏳ Após o pagamento, aguarde a liberação automática.",
-            parse_mode="Markdown"
-        )
-
-    except:
-        await update.message.reply_text("❌ Erro ao gerar Pix. Tente novamente.")
+    await update.message.reply_text(
+        f"💳 PIX GERADO ✅\n"
+        f"💰 Valor: R${valor}\n\n"
+        f"📋 Copia e cola:\n{qr_copia_cola}\n\n"
+        f"⏳ Após pagar, aguarde a liberação."
+    )
+except Exception as e:
+    await update.message.reply_text(f"❌ Pix veio sem dados esperados: {pagamento}")
 
 # ===============================
 # APP
