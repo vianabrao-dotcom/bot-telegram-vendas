@@ -1,6 +1,6 @@
 import os
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -21,8 +21,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Aguarde a próxima etapa."
     )
 
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+def main():
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN não encontrado nas variáveis de ambiente")
 
-app.run_polling()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
