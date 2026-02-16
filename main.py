@@ -13,20 +13,25 @@ def gerar_pix(valor):
     url = "https://api.mercadopago.com/v1/payments"
     headers = {
         "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "X-Idempotency-Key": str(os.urandom(16).hex())
     }
 
     data = {
-        "transaction_amount": valor,
+        "transaction_amount": float(valor),
         "description": "Assinatura VIP",
         "payment_method_id": "pix",
         "payer": {
-            "email": "cliente@email.com"
+            "email": "pagador_teste@gmail.com"
         }
     }
 
-    response = requests.post(url, headers=headers, json=data)
-    return response.json()
+    resp = requests.post(url, headers=headers, json=data, timeout=20)
+    try:
+        return resp.status_code, resp.json()
+    except:
+        return resp.status_code, {"raw": resp.text}
+
 
 # ===============================
 # START
