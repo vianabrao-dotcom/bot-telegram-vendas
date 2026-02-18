@@ -1,15 +1,19 @@
 import os
+import re
+import io
 import uuid
 import json
 import time
+import sqlite3
 import logging
 import asyncio
-from io import BytesIO
-from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import requests
-from telegram import Update
+from aiohttp import web
+
+from telegram import Update, InputFile
+from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -18,140 +22,267 @@ from telegram.ext import (
     filters,
 )
 
-from aiohttp import web
-
-
 # =========================
-# CONFIG
+# CONFIG / ENV
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "").strip()
 
-# Grupo privado (para remover quando expirar)
-TELEGRAM_GROUP_ID = os.getenv("TELEGRAM_GROUP_ID", "").strip()
+# URL pública do Railway (ex: https://seu-servico.up.railway.app)
+BASE_URL = os.getenv("BASE_URL", "").strip().rstrip("/")
 
-# Domínio para email "válido" (não usa seu email pessoal)
-PAYER_EMAIL_DOMAIN = os.getenv("PAYER_EMAIL_DOMAIN", "primevip.com").strip()
+# Segredo simples pro webhook do MP (evita hits externos)
+MP_WEBHOOK_SECRET = os.getenv("MP_WEBHOOK_SECRET", "").strip()
 
-# DB local (use Volume no Railway pra persistir)
-USERS_DB_PATH = Path(os.getenv("USERS_DB_PATH", "/data/users.json" if os.getenv("RAILWAY_ENVIRONMENT") else "users.json"))
+# Grupo VIP (opcional, mas recomendado)
+TELEGRAM_GROUP_ID = os.getenv("TELEGRAM_GROUP_ID", "").strip()  # ex: -1001234567890
 
-# Janela de renovação: 24h
-RENEW_WINDOW_HOURS = int(os.getenv("RENEW_WINDOW_HOURS", "24"))
+# Porta do Railway
+PORT = int(os.getenv("PORT", "8080"))
 
-# Webhook server
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
-WEBHOOK_PORT = int(os.getenv("PORT", os.getenv("WEBHOOK_PORT", "8080")))
-
-# URL pública do seu serviço (necessário para você cadastrar no Mercado Pago)
-# Ex: https://observant-bravery-production-xxxx.up.railway.app
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
-
-# Endpoint do webhook
-MP_WEBHOOK_PATH = "/mp/webhook"
+# Banco local (Railway normalmente preserva o disco do serviço enquanto existir)
+DB_PATH = os.getenv("DB_PATH", "primevip.sqlite3").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN não encontrado nas variáveis de ambiente.")
 if not MP_ACCESS_TOKEN:
     raise RuntimeError("MP_ACCESS_TOKEN não encontrado nas variáveis de ambiente.")
+if not BASE_URL:
+    raise RuntimeError("BASE_URL não encontrado (ex: https://xxxx.up.railway.app).")
+if not MP_WEBHOOK_SECRET:
+    raise RuntimeError("MP_WEBHOOK_SECRET não encontrado (crie um texto aleatório).")
 
+WEBHOOK_URL = f"{BASE_URL}/mp/webhook?secret={MP_WEBHOOK_SECRET}"
 
 # =========================
 # LOG
 # =========================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("primevip")
 
 
 # =========================
-# PREÇOS
+# DB (SQLite)
 # =========================
-# VALORES INICIAIS (menu padrão)
-PRECO_INICIAL = {
-    "1": ("Plano Semanal", 19.90, 7),
-    "2": ("Plano Mensal", 29.90, 30),
-    "3": ("Plano Anual", 39.90, 365),
+def db_connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def db_init():
+    conn = db_connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS subscriptions (
+        user_id INTEGER PRIMARY KEY,
+        chat_id INTEGER NOT NULL,
+        status TEXT NOT NULL,              -- active / expired
+        plan_code TEXT NOT NULL,           -- W / M / A
+        approved_payment_id INTEGER,
+        approved_at TEXT,
+        expires_at TEXT,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS payments (
+        payment_id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        chat_id INTEGER NOT NULL,
+        plan_code TEXT NOT NULL,
+        amount REAL NOT NULL,
+        status TEXT NOT NULL,              -- pending / approved / rejected / cancelled
+        external_reference TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def now_utc_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def parse_iso(dt_str: str):
+    if not dt_str:
+        return None
+    return datetime.fromisoformat(dt_str)
+
+
+def upsert_payment(payment_id: int, user_id: int, chat_id: int, plan_code: str, amount: float, status: str, external_reference: str):
+    conn = db_connect()
+    cur = conn.cursor()
+    ts = now_utc_iso()
+    cur.execute("""
+        INSERT INTO payments (payment_id, user_id, chat_id, plan_code, amount, status, external_reference, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(payment_id) DO UPDATE SET
+            status=excluded.status,
+            external_reference=excluded.external_reference,
+            updated_at=excluded.updated_at
+    """, (payment_id, user_id, chat_id, plan_code, amount, status, external_reference, ts, ts))
+    conn.commit()
+    conn.close()
+
+
+def set_payment_status(payment_id: int, status: str):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE payments SET status=?, updated_at=? WHERE payment_id=?",
+                (status, now_utc_iso(), payment_id))
+    conn.commit()
+    conn.close()
+
+
+def get_subscription(user_id: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM subscriptions WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def upsert_subscription_active(user_id: int, chat_id: int, plan_code: str, approved_payment_id: int, approved_at_iso: str, expires_at_iso: str):
+    conn = db_connect()
+    cur = conn.cursor()
+    created_at = now_utc_iso()
+    cur.execute("""
+        INSERT INTO subscriptions (user_id, chat_id, status, plan_code, approved_payment_id, approved_at, expires_at, created_at)
+        VALUES (?, ?, 'active', ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            chat_id=excluded.chat_id,
+            status='active',
+            plan_code=excluded.plan_code,
+            approved_payment_id=excluded.approved_payment_id,
+            approved_at=excluded.approved_at,
+            expires_at=excluded.expires_at
+    """, (user_id, chat_id, plan_code, approved_payment_id, approved_at_iso, expires_at_iso, created_at))
+    conn.commit()
+    conn.close()
+
+
+def mark_subscription_expired(user_id: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE subscriptions SET status='expired' WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def list_expired_active_subscriptions():
+    """
+    Retorna assinaturas ativas cujo expires_at já passou.
+    """
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM subscriptions WHERE status='active' AND expires_at IS NOT NULL")
+    rows = cur.fetchall()
+    conn.close()
+
+    expired = []
+    now = datetime.now(timezone.utc)
+    for r in rows:
+        exp = parse_iso(r["expires_at"])
+        if exp and exp <= now:
+            expired.append(r)
+    return expired
+
+
+# =========================
+# PLANOS / MENUS
+# =========================
+# Planos "originais" (menu inicial)
+PLANS_INITIAL = {
+    "1": ("Plano Semanal", 19.90, "W"),
+    "2": ("Plano Mensal", 29.90, "M"),
+    "3": ("Plano Anual", 39.90, "A"),
+    # opção promocional anual
+    "4": ("Plano Anual Promocional", 29.99, "A"),
 }
 
-# OPÇÃO 4: ANUAL PROMOCIONAL (menu padrão)
-PRECO_ANUAL_PROMO = ("Plano Anual Promocional", 29.99, 365)
-
-# MENU EXCLUSIVO DE RENOVAÇÃO (válido por 24h)
-PRECO_RENOVACAO = {
-    "1": ("Renovação Semanal", 10.90, 7),
-    "2": ("Renovação Mensal", 15.90, 30),
-    "3": ("Renovação Anual", 19.90, 365),
+# Planos de renovação (menu renovação, válido por 24h antes de expirar)
+PLANS_RENEWAL = {
+    "1": ("Plano Semanal (Renovação)", 10.90, "W"),
+    "2": ("Plano Mensal (Renovação)", 15.90, "M"),
+    "3": ("Plano Anual (Renovação)", 19.90, "A"),
 }
 
+WELCOME_TEXT = (
+    "🔥 *Bem-vindo!* Você acaba de garantir acesso ao conteúdo mais exclusivo e atualizado do momento!\n"
+    "Centenas de pessoas já estão dentro aproveitando todos os benefícios. Agora é sua vez!\n\n"
+    "Escolha abaixo o plano ideal e entre imediatamente no grupo privado: 👇\n\n"
+)
 
-# =========================
-# TEXTOS
-# =========================
-def menu_inicial_texto() -> str:
+def menu_inicial():
     return (
-        "🔥 Bem-vindo! Você acaba de garantir acesso ao conteúdo mais exclusivo e atualizado do momento!\n"
-        "Centenas de pessoas já estão dentro aproveitando todos os benefícios. Agora é a sua vez!\n\n"
-        "Escolha abaixo o plano ideal e entre imediatamente no grupo privado: 👇\n\n"
-        f"1️⃣ {PRECO_INICIAL['1'][0]} — R${PRECO_INICIAL['1'][1]:.2f}\n"
-        f"2️⃣ {PRECO_INICIAL['2'][0]} — R${PRECO_INICIAL['2'][1]:.2f}\n"
-        f"3️⃣ {PRECO_INICIAL['3'][0]} — R${PRECO_INICIAL['3'][1]:.2f}\n\n"
-        f"4️⃣ 🎁 {PRECO_ANUAL_PROMO[0]} — R${PRECO_ANUAL_PROMO[1]:.2f}\n\n"
-        "Digite apenas o número do plano desejado."
+        WELCOME_TEXT +
+        "1️⃣ Plano Semanal — *R$19,90*\n"
+        "2️⃣ Plano Mensal — *R$29,90*\n"
+        "3️⃣ Plano Anual — *R$39,90*\n\n"
+        "4️⃣ 🎁 *Plano Anual Promocional* — *R$29,99*\n\n"
+        "_Digite apenas o número do plano desejado._"
     )
 
-def menu_renovacao_texto() -> str:
+def menu_renovacao(expires_at_iso: str):
+    exp = parse_iso(expires_at_iso)
+    exp_local = exp.astimezone(timezone(timedelta(hours=-3))) if exp else None  # BRT aproximado
+    exp_str = exp_local.strftime("%d/%m/%Y %H:%M") if exp_local else "em breve"
     return (
-        "🎁 MENU EXCLUSIVO DE RENOVAÇÃO (válido por 24 horas)\n\n"
-        "🔥 Oferta liberada por 24 horas:\n\n"
-        f"1️⃣ {PRECO_RENOVACAO['1'][0]} — R${PRECO_RENOVACAO['1'][1]:.2f}\n"
-        f"2️⃣ {PRECO_RENOVACAO['2'][0]} — R${PRECO_RENOVACAO['2'][1]:.2f}\n"
-        f"3️⃣ {PRECO_RENOVACAO['3'][0]} — R${PRECO_RENOVACAO['3'][1]:.2f}\n\n"
-        "Esses valores expiram em 24 horas."
+        "🎁 *MENU EXCLUSIVO DE RENOVAÇÃO (válido por 24h)*\n\n"
+        "Oferta liberada por 24 horas:\n\n"
+        "1️⃣ Plano Semanal — *R$10,90*\n"
+        "2️⃣ Plano Mensal — *R$15,90*\n"
+        "3️⃣ Plano Anual — *R$19,90*\n\n"
+        f"⏳ Sua assinatura expira em: *{exp_str}*\n"
+        "_Esses valores expiram em 24 horas._"
     )
 
+def is_in_renewal_window(sub_row) -> bool:
+    if not sub_row:
+        return False
+    if sub_row["status"] != "active":
+        return False
+    exp = parse_iso(sub_row["expires_at"])
+    if not exp:
+        return False
+    now = datetime.now(timezone.utc)
+    return (exp - now) <= timedelta(hours=24)
 
-# =========================
-# USERS DB
-# =========================
-# Por usuário:
-# {
-#   "stage": "INITIAL" | "PENDING" | "ACTIVE" | "RENEW_WINDOW" | "EXPIRED",
-#   "expires_at": 1700000000,           # epoch seconds (SÓ quando approved)
-#   "last_payment_id": "123",
-#   "pending": {
-#       "payment_id": "123",
-#       "days": 30,
-#       "plan_name": "Plano Mensal",
-#       "amount": 29.90,
-#       "created_at": 1700000000
-#   }
-# }
-def load_users_db() -> dict:
-    try:
-        if USERS_DB_PATH.exists():
-            return json.loads(USERS_DB_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {}
 
-def save_users_db(db: dict) -> None:
-    USERS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    USERS_DB_PATH.write_text(json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
-
-def get_user(db: dict, user_id: int) -> dict:
-    return db.get(str(user_id), {})
-
-def set_user(db: dict, user_id: int, payload: dict) -> None:
-    db[str(user_id)] = payload
-
-def now_ts() -> int:
-    return int(time.time())
+def plan_duration(plan_code: str) -> timedelta:
+    if plan_code == "W":
+        return timedelta(days=7)
+    if plan_code == "M":
+        return timedelta(days=30)
+    if plan_code == "A":
+        return timedelta(days=365)
+    return timedelta(days=30)
 
 
 # =========================
-# MERCADO PAGO
+# MERCADO PAGO (PIX)
 # =========================
-def gerar_pix(valor: float, descricao: str, payer_email: str, payer_first_name: str = "Cliente", payer_last_name: str = "VIP"):
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+def safe_payer_email(user) -> str:
+    """
+    Melhor prática aqui: usar um email real do seu negócio (estável e aceito).
+    Isso evita erro de validação do MP e evita criar domínios "fakes" que às vezes falham.
+    """
+    # Se preferir outro, troque aqui.
+    return "braoviana@gmail.com"
+
+def mp_create_pix_payment(amount: float, description: str, payer_email: str, external_reference: str):
     url = "https://api.mercadopago.com/v1/payments"
     idempotency_key = str(uuid.uuid4())
 
@@ -161,423 +292,395 @@ def gerar_pix(valor: float, descricao: str, payer_email: str, payer_first_name: 
         "X-Idempotency-Key": idempotency_key,
     }
 
+    if not EMAIL_RE.match(payer_email):
+        raise ValueError("payer_email inválido")
+
     payload = {
-        "transaction_amount": float(valor),
-        "description": descricao,
+        "transaction_amount": float(amount),
+        "description": description,
         "payment_method_id": "pix",
+        "notification_url": WEBHOOK_URL,  # <-- ESSENCIAL para Pix
+        "external_reference": external_reference,
         "payer": {
             "email": payer_email,
-            "first_name": payer_first_name,
-            "last_name": payer_last_name,
         },
     }
 
-    resp = requests.post(url, headers=headers, json=payload, timeout=30)
+    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
     try:
         data = resp.json()
     except Exception:
-        data = resp.text
+        data = {"raw": resp.text}
     return resp.status_code, data
 
-def extrair_pix(mp_response: dict):
+
+def mp_get_payment(payment_id: int):
+    url = f"https://api.mercadopago.com/v1/payments/{payment_id}"
+    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
+    resp = requests.get(url, headers=headers, timeout=30)
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"raw": resp.text}
+    return resp.status_code, data
+
+
+def extract_pix_data(mp_response: dict):
     poi = mp_response.get("point_of_interaction", {}) if isinstance(mp_response, dict) else {}
     tx = poi.get("transaction_data", {}) if isinstance(poi, dict) else {}
 
     qr_code = tx.get("qr_code")
     ticket_url = tx.get("ticket_url")
-    payment_id = mp_response.get("id") if isinstance(mp_response, dict) else None
+    qr_code_base64 = tx.get("qr_code_base64")
 
-    return qr_code, ticket_url, payment_id
-
-def buscar_pagamento(payment_id: str) -> dict:
-    url = f"https://api.mercadopago.com/v1/payments/{payment_id}"
-    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
-    resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    return qr_code, ticket_url, qr_code_base64
 
 
 # =========================
-# EMAIL DO PAYER
+# TELEGRAM: HELPERS
 # =========================
-def make_payer_email(user_id: int) -> str:
-    return f"user{user_id}@{PAYER_EMAIL_DOMAIN}"
+async def send_pix_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE, nome_plano: str, valor: float, qr_code: str, ticket_url: str):
+    """
+    Envia Pix no chat + anexa TXT para facilitar copiar (resolve o problema de "não consigo copiar")
+    """
+    # Mensagem curta + código (sem backticks gigantes — alguns clientes ficam ruins)
+    msg = (
+        "✅ *PIX GERADO COM SUCESSO!*\n\n"
+        f"📦 Plano: *{nome_plano}*\n"
+        f"💰 Valor: *R${valor:.2f}*\n\n"
+        "📋 *Copia e cola:*\n"
+        f"{qr_code}\n\n"
+    )
+    if ticket_url:
+        msg += f"🔗 *Link do QR:* {ticket_url}\n\n"
+    msg += "⏳ Após pagar, aguarde a confirmação."
+
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+    # TXT anexo (muito mais fácil copiar/compartilhar)
+    txt = f"Plano: {nome_plano}\nValor: R${valor:.2f}\n\nPIX COPIA E COLA:\n{qr_code}\n\nLink (se houver):\n{ticket_url or '-'}\n"
+    bio = io.BytesIO(txt.encode("utf-8"))
+    bio.name = "pix_copia_e_cola.txt"
+    await update.message.reply_document(InputFile(bio), caption="📎 Arquivo com o PIX (copia e cola)")
 
 
-# =========================
-# REGRAS DE MENU
-# =========================
-def is_in_renew_window(user_data: dict) -> bool:
-    exp = user_data.get("expires_at")
-    if not exp:
-        return False
-    return (exp - now_ts()) <= (RENEW_WINDOW_HOURS * 3600) and (exp - now_ts()) > 0
-
-def is_expired(user_data: dict) -> bool:
-    exp = user_data.get("expires_at")
-    return bool(exp) and now_ts() >= exp
-
-
-# =========================
-# GRUPO (REMOVER)
-# =========================
-async def remover_do_grupo_se_configurado(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+async def try_send_group_invite(app, user_id: int, chat_id: int):
+    """
+    Cria convite do grupo e envia ao usuário.
+    (O bot precisa ser admin no grupo e poder criar links.)
+    """
     if not TELEGRAM_GROUP_ID:
         return
+
+    group_id = int(TELEGRAM_GROUP_ID)
     try:
-        await context.bot.ban_chat_member(chat_id=int(TELEGRAM_GROUP_ID), user_id=user_id)
-        await context.bot.unban_chat_member(chat_id=int(TELEGRAM_GROUP_ID), user_id=user_id)
+        invite = await app.bot.create_chat_invite_link(
+            chat_id=group_id,
+            member_limit=1,
+            creates_join_request=False
+        )
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "✅ *Pagamento aprovado!*\n\n"
+                "Aqui está seu link de acesso ao grupo VIP:\n"
+                f"{invite.invite_link}\n\n"
+                "Se tiver qualquer dúvida, me chame aqui."
+            ),
+            parse_mode=ParseMode.MARKDOWN
+        )
     except Exception as e:
-        logger.warning(f"Falha ao remover do grupo user_id={user_id}: {e}")
+        logger.exception("Falha ao criar/enviar convite do grupo: %s", e)
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text="✅ *Pagamento aprovado!* (Não consegui gerar o link do grupo automaticamente. Verifique se o bot é admin e tem permissão de criar convites.)",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
 
-# =========================
-# STATUS / APROVAÇÃO
-# =========================
-def parse_mp_datetime(dt_str: str) -> int:
+async def remove_user_from_group(app, user_id: int):
     """
-    Mercado Pago costuma retornar ISO com timezone (ex: 2026-02-16T06:27:55.123-04:00).
-    Se falhar, usa agora.
+    Remove usuário do grupo ao expirar.
     """
-    if not dt_str:
-        return now_ts()
+    if not TELEGRAM_GROUP_ID:
+        return
+    group_id = int(TELEGRAM_GROUP_ID)
     try:
-        # Python 3.11: fromisoformat entende offset
-        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-        return int(dt.timestamp())
-    except Exception:
-        return now_ts()
-
-def aplicar_aprovacao(db: dict, user_id: int, payment_data: dict) -> bool:
-    """
-    Se o pagamento está approved e existe um pending compatível,
-    grava expires_at SOMENTE aqui.
-    """
-    u = get_user(db, user_id)
-    pending = u.get("pending") or {}
-    pending_payment_id = str(pending.get("payment_id") or "")
-
-    payment_id = str(payment_data.get("id") or "")
-    status = (payment_data.get("status") or "").lower()
-
-    if not payment_id or status != "approved":
-        return False
-
-    # Só aplica se for o mesmo pagamento pendente
-    if pending_payment_id and pending_payment_id != payment_id:
-        return False
-
-    days = int(pending.get("days") or 0)
-    if days <= 0:
-        # fallback: se não tiver days salvo, não aplica
-        return False
-
-    approved_ts = parse_mp_datetime(payment_data.get("date_approved") or payment_data.get("date_created"))
-    expires_at = approved_ts + (days * 24 * 3600)
-
-    u["stage"] = "ACTIVE"
-    u["expires_at"] = expires_at
-    u["last_payment_id"] = payment_id
-    u["pending"] = {}  # limpa pendência
-
-    set_user(db, user_id, u)
-    return True
-
-def find_user_by_payment_id(db: dict, payment_id: str) -> int | None:
-    pid = str(payment_id)
-    for k, v in db.items():
-        pending = (v or {}).get("pending") or {}
-        if str(pending.get("payment_id") or "") == pid:
-            try:
-                return int(k)
-            except Exception:
-                return None
-    return None
+        # ban curto remove; depois pode desbanir automaticamente
+        until = datetime.now(timezone.utc) + timedelta(minutes=1)
+        await app.bot.ban_chat_member(chat_id=group_id, user_id=user_id, until_date=until)
+        await app.bot.unban_chat_member(chat_id=group_id, user_id=user_id)
+    except Exception as e:
+        logger.exception("Falha ao remover usuário do grupo: %s", e)
 
 
 # =========================
-# TELEGRAM HANDLERS
+# HANDLERS TELEGRAM
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = load_users_db()
-    u = get_user(db, update.effective_user.id)
+    user = update.effective_user
+    sub = get_subscription(user.id)
 
-    if is_expired(u):
-        u["stage"] = "EXPIRED"
-        set_user(db, update.effective_user.id, u)
-        save_users_db(db)
-
-    if is_in_renew_window(u) or u.get("stage") == "RENEW_WINDOW":
-        await update.message.reply_text(menu_renovacao_texto())
+    if sub and sub["status"] == "active" and is_in_renewal_window(sub):
+        await update.message.reply_text(menu_renovacao(sub["expires_at"]), parse_mode=ParseMode.MARKDOWN)
         return
 
-    await update.message.reply_text(menu_inicial_texto())
-
-
-async def renovar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = load_users_db()
-    u = get_user(db, update.effective_user.id)
-
-    if is_in_renew_window(u):
-        u["stage"] = "RENEW_WINDOW"
-        set_user(db, update.effective_user.id, u)
-        save_users_db(db)
-        await update.message.reply_text(menu_renovacao_texto())
-    else:
-        await update.message.reply_text("⏳ A renovação com desconto só aparece quando faltar 24h para encerrar sua assinatura.")
-
-
-async def verificar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Fallback manual: /verificar
-    Se tiver um pagamento pendente salvo, consulta o MP e aplica aprovação.
-    """
-    db = load_users_db()
-    user_id = update.effective_user.id
-    u = get_user(db, user_id)
-    pending = u.get("pending") or {}
-    payment_id = str(pending.get("payment_id") or "")
-
-    if not payment_id:
-        await update.message.reply_text("Você não tem nenhum pagamento pendente para verificar.")
-        return
-
-    await update.message.reply_text("🔎 Verificando pagamento no Mercado Pago...")
-
-    try:
-        payment_data = buscar_pagamento(payment_id)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Falha ao consultar pagamento: {e}")
-        return
-
-    status = (payment_data.get("status") or "").lower()
-
-    if status == "approved":
-        ok = aplicar_aprovacao(db, user_id, payment_data)
-        save_users_db(db)
-        if ok:
-            await update.message.reply_text("✅ Pagamento aprovado! Sua assinatura foi ativada e a validade foi registrada.")
-        else:
-            await update.message.reply_text("✅ Pagamento aprovado, mas não consegui vincular ao seu pedido pendente. Me envie o print do pagamento e eu ajusto.")
-    else:
-        await update.message.reply_text(f"⏳ Ainda não aprovado. Status atual: {status}")
+    await update.message.reply_text(menu_inicial(), parse_mode=ParseMode.MARKDOWN)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    texto = (update.message.text or "").strip().lower()
     user = update.effective_user
+    chat_id = update.effective_chat.id
+    texto = (update.message.text or "").strip()
 
-    if texto in ("/start", "start"):
+    # aceitar "Start" como /start (muita gente digita Start)
+    if texto.lower() in ("/start", "start"):
         await start(update, context)
         return
 
-    db = load_users_db()
-    u = get_user(db, user.id)
+    sub = get_subscription(user.id)
+    renewal_mode = sub and sub["status"] == "active" and is_in_renewal_window(sub)
 
-    # Expirado -> remove e volta pro menu inicial
-    if is_expired(u):
-        await remover_do_grupo_se_configurado(context, user.id)
-        u = {"stage": "EXPIRED"}
-        set_user(db, user.id, u)
-        save_users_db(db)
-        await update.message.reply_text("🚫 Sua assinatura expirou. Para voltar ao grupo, faça uma nova assinatura com os valores iniciais.\n\n" + menu_inicial_texto())
-        return
+    plans = PLANS_RENEWAL if renewal_mode else PLANS_INITIAL
 
-    in_renew = is_in_renew_window(u) or u.get("stage") == "RENEW_WINDOW"
-
-    if in_renew:
-        escolhas = {"1", "2", "3"}
-    else:
-        escolhas = {"1", "2", "3", "4"}
-
-    if texto not in escolhas:
-        await update.message.reply_text("❌ Opção inválida. Digite apenas 1, 2, 3" + ("" if in_renew else " ou 4") + ".")
-        await update.message.reply_text(menu_renovacao_texto() if in_renew else menu_inicial_texto())
-        return
-
-    # Seleciona plano
-    if in_renew:
-        nome_plano, valor, dias = PRECO_RENOVACAO[texto]
-        descricao = f"{nome_plano} - Prime VIP"
-    else:
-        if texto == "4":
-            nome_plano, valor, dias = PRECO_ANUAL_PROMO
-            descricao = f"{nome_plano} - Prime VIP"
+    if texto not in plans:
+        if renewal_mode:
+            await update.message.reply_text("❌ Opção inválida. Digite 1, 2 ou 3.\n\n" + menu_renovacao(sub["expires_at"]), parse_mode=ParseMode.MARKDOWN)
         else:
-            nome_plano, valor, dias = PRECO_INICIAL[texto]
-            descricao = f"{nome_plano} - Prime VIP"
+            await update.message.reply_text("❌ Opção inválida. Digite 1, 2, 3 ou 4.\n\n" + menu_inicial(), parse_mode=ParseMode.MARKDOWN)
+        return
 
-    payer_email = make_payer_email(user.id)
+    nome_plano, valor, plan_code = plans[texto]
 
     await update.message.reply_text("⏳ Gerando seu PIX...")
 
+    payer_email = safe_payer_email(user)
+
+    # external_reference para identificar o usuário ao receber webhook
+    external_reference = f"tg_user:{user.id}|chat:{chat_id}|plan:{plan_code}|opt:{texto}|ref:{uuid.uuid4().hex[:10]}"
+
+    descricao = f"{nome_plano} - Prime VIP"
+
+    # chamada MP (em thread pra não travar o bot)
     try:
-        status, pagamento = gerar_pix(
-            valor=valor,
-            descricao=descricao,
-            payer_email=payer_email,
-            payer_first_name=user.first_name or "Cliente",
-            payer_last_name=user.last_name or "VIP",
+        status_code, pagamento = await asyncio.to_thread(
+            mp_create_pix_payment, valor, descricao, payer_email, external_reference
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Erro na requisição do PIX: {e}")
+        await update.message.reply_text(f"❌ Erro interno ao gerar Pix: {e}")
         return
 
-    if status not in (200, 201):
+    if status_code not in (200, 201):
         await update.message.reply_text(
-            "❌ Erro ao gerar Pix. Tente novamente.\n\n"
-            f"Status: {status}\n"
-            f"Resposta: {str(pagamento)[:3500]}"
+            "❌ *Erro ao gerar Pix.* Tente novamente.\n\n"
+            f"Status: `{status_code}`\n"
+            f"Resposta: `{str(pagamento)[:3500]}`",
+            parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    qr_code, ticket_url, payment_id = extrair_pix(pagamento)
+    payment_id = pagamento.get("id")
+    mp_status = pagamento.get("status", "pending")
+    ext_ref = pagamento.get("external_reference", external_reference)
 
-    if not qr_code or not payment_id:
+    if payment_id:
+        upsert_payment(int(payment_id), user.id, chat_id, plan_code, float(valor), str(mp_status), str(ext_ref))
+
+    qr_code, ticket_url, _ = extract_pix_data(pagamento)
+
+    if not qr_code:
         await update.message.reply_text(
-            "❌ O Mercado Pago criou a cobrança, mas não retornou o PIX corretamente.\n\n"
-            f"Resposta: {str(pagamento)[:3500]}"
+            "❌ O Mercado Pago criou o pagamento, mas não retornou o código PIX neste formato.\n\n"
+            f"Resposta: `{str(pagamento)[:3500]}`",
+            parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    # >>> AQUI É A MUDANÇA IMPORTANTE:
-    # Não grava expires_at aqui. Só salva como PENDENTE aguardando approval.
-    u["stage"] = "PENDING"
-    u["pending"] = {
-        "payment_id": str(payment_id),
-        "days": int(dias),
-        "plan_name": nome_plano,
-        "amount": float(valor),
-        "created_at": now_ts(),
-    }
-    set_user(db, user.id, u)
-    save_users_db(db)
-
-    # Mensagem
-    msg = (
-        "✅ PIX GERADO COM SUCESSO!\n\n"
-        f"📦 Plano: {nome_plano}\n"
-        f"💰 Valor: R${valor:.2f}\n\n"
-        "📋 Copia e cola: (enviei abaixo e também em arquivo .txt)\n"
-    )
-    if ticket_url:
-        msg += f"🔗 Link do QR: {ticket_url}\n\n"
-    msg += "⏳ Após pagar, você pode usar /verificar para confirmar. (o webhook também confirma automaticamente)"
-    await update.message.reply_text(msg)
-
-    # Copia e cola como mensagem + txt (sempre copiável)
-    await update.message.reply_text(qr_code)
-
-    txt = BytesIO(qr_code.encode("utf-8"))
-    txt.name = "pix_copia_e_cola.txt"
-    await update.message.reply_document(document=txt, filename="pix_copia_e_cola.txt")
+    await send_pix_to_user(update, context, nome_plano, float(valor), qr_code, ticket_url)
 
 
 # =========================
-# WEBHOOK MERCADO PAGO (AIOHTTP)
+# WEBHOOK MP (AIOHTTP)
 # =========================
-async def mp_webhook(request: web.Request) -> web.Response:
-    """
-    Mercado Pago pode enviar id por querystring (?data.id=123) ou no json.
-    A gente resolve assim:
-    - tenta query param data.id
-    - tenta json -> data.id ou id
-    - consulta /v1/payments/{id}
-    - se status approved, procura usuário pendente e ativa
-    """
+async def mp_webhook_handler(request: web.Request):
+    # valida segredo
+    secret = request.query.get("secret", "")
+    if secret != MP_WEBHOOK_SECRET:
+        return web.Response(status=401, text="unauthorized")
+
+    # MP pode enviar JSON ou query params (topic/id)
+    payload = {}
     try:
-        db = load_users_db()
+        payload = await request.json()
+    except Exception:
+        payload = {}
 
-        # 1) tenta querystring
-        payment_id = request.query.get("data.id") or request.query.get("id")
+    payment_id = None
 
-        # 2) tenta body
-        body = None
+    # formato comum: {"type":"payment","data":{"id":123}}
+    if isinstance(payload, dict):
+        data = payload.get("data") or {}
+        if isinstance(data, dict) and "id" in data:
+            payment_id = data.get("id")
+
+    # fallback por query string
+    if not payment_id:
+        payment_id = request.query.get("id") or request.query.get("data.id")
+
+    if not payment_id:
+        return web.Response(status=200, text="ok")
+
+    try:
+        payment_id = int(payment_id)
+    except Exception:
+        return web.Response(status=200, text="ok")
+
+    # consulta pagamento no MP pra confirmar status + external_reference
+    status_code, mp_data = await asyncio.to_thread(mp_get_payment, payment_id)
+    if status_code != 200 or not isinstance(mp_data, dict):
+        return web.Response(status=200, text="ok")
+
+    status = mp_data.get("status", "")
+    ext_ref = mp_data.get("external_reference", "")
+
+    # tenta encontrar user/chat pelo external_reference salvo
+    # (a gente salva payments quando cria)
+    user_id = None
+    chat_id = None
+    plan_code = None
+    amount = None
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM payments WHERE payment_id=?", (payment_id,))
+    row = cur.fetchone()
+    conn.close()
+
+    if row:
+        user_id = int(row["user_id"])
+        chat_id = int(row["chat_id"])
+        plan_code = row["plan_code"]
+        amount = float(row["amount"])
+
+    # atualiza status do payment no DB
+    try:
+        set_payment_status(payment_id, status or "pending")
+    except Exception:
+        pass
+
+    # se não achou no DB, não tem como liberar automaticamente
+    if not user_id or not chat_id:
+        logger.warning("Webhook recebido, mas pagamento %s não encontrado no DB. ext_ref=%s", payment_id, ext_ref)
+        return web.Response(status=200, text="ok")
+
+    # processa aprovação
+    if status == "approved":
+        approved_at = datetime.now(timezone.utc)
+        expires_at = approved_at + plan_duration(plan_code)
+
+        upsert_subscription_active(
+            user_id=user_id,
+            chat_id=chat_id,
+            plan_code=plan_code,
+            approved_payment_id=payment_id,
+            approved_at_iso=approved_at.isoformat(),
+            expires_at_iso=expires_at.isoformat()
+        )
+
+        # avisa e manda link do grupo
+        app = request.app["tg_app"]
         try:
-            body = await request.json()
+            await try_send_group_invite(app, user_id=user_id, chat_id=chat_id)
         except Exception:
-            body = None
+            logger.exception("Falha ao avisar usuário após approved.")
 
-        if not payment_id and isinstance(body, dict):
-            data = body.get("data") if isinstance(body.get("data"), dict) else {}
-            payment_id = data.get("id") or body.get("id")
+    return web.Response(status=200, text="ok")
 
-        if not payment_id:
-            return web.json_response({"ok": True, "note": "no payment id"}, status=200)
 
-        # consulta pagamento
+# =========================
+# JOB: EXPIRAR E REMOVER DO GRUPO
+# =========================
+async def enforce_expirations(app):
+    expired = list_expired_active_subscriptions()
+    if not expired:
+        return
+
+    for sub in expired:
+        user_id = int(sub["user_id"])
+        chat_id = int(sub["chat_id"])
+
+        mark_subscription_expired(user_id)
+
         try:
-            payment_data = await asyncio.to_thread(buscar_pagamento, str(payment_id))
-        except Exception as e:
-            logger.warning(f"Webhook: falha ao buscar pagamento {payment_id}: {e}")
-            return web.json_response({"ok": True, "note": "cannot fetch payment"}, status=200)
+            await remove_user_from_group(app, user_id)
+        except Exception:
+            logger.exception("Falha removendo do grupo user_id=%s", user_id)
 
-        status = (payment_data.get("status") or "").lower()
-        if status != "approved":
-            return web.json_response({"ok": True, "status": status}, status=200)
-
-        # encontra usuário pelo payment_id pendente
-        user_id = find_user_by_payment_id(db, str(payment_id))
-        if not user_id:
-            # pode acontecer se o db resetou (sem Volume) ou se payment_id não foi salvo
-            logger.warning(f"Webhook: payment approved {payment_id} mas não encontrei usuário pendente.")
-            return web.json_response({"ok": True, "status": "approved_no_user"}, status=200)
-
-        ok = aplicar_aprovacao(db, user_id, payment_data)
-        save_users_db(db)
-
-        if ok:
-            # não mando msg automática aqui pra evitar spam; se quiser eu adiciono depois
-            logger.info(f"Webhook: aprovado e ativado user_id={user_id}, payment_id={payment_id}")
-            return web.json_response({"ok": True, "status": "approved_activated"}, status=200)
-
-        return web.json_response({"ok": True, "status": "approved_not_applied"}, status=200)
-
-    except Exception as e:
-        logger.exception(f"Webhook error: {e}")
-        return web.json_response({"ok": True}, status=200)
+        try:
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "⛔️ Sua assinatura expirou e o acesso foi encerrado.\n\n"
+                    "Para voltar, faça uma nova assinatura com os valores iniciais.\n\n"
+                    "Digite /start para ver os planos."
+                )
+            )
+        except Exception:
+            logger.exception("Falha enviando msg de expiração user_id=%s", user_id)
 
 
-async def start_web_server():
-    app = web.Application()
-    app.router.add_post(MP_WEBHOOK_PATH, mp_webhook)
-    runner = web.AppRunner(app)
+async def expiration_sweeper(context: ContextTypes.DEFAULT_TYPE):
+    app = context.application
+    await enforce_expirations(app)
+
+
+# =========================
+# STARTUP / AIOHTTP SERVER
+# =========================
+async def post_init(app):
+    # inicia DB
+    db_init()
+
+    # inicia servidor aiohttp (para webhook MP)
+    aio = web.Application()
+    aio["tg_app"] = app
+    aio.router.add_post("/mp/webhook", mp_webhook_handler)
+
+    runner = web.AppRunner(aio)
     await runner.setup()
-    site = web.TCPSite(runner, WEBHOOK_HOST, WEBHOOK_PORT)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"Webhook server rodando em http://{WEBHOOK_HOST}:{WEBHOOK_PORT}{MP_WEBHOOK_PATH}")
+
+    app.bot_data["aio_runner"] = runner
+    logger.info("Servidor MP webhook ativo em %s", WEBHOOK_URL)
+
+    # job para varrer expirados a cada 10 min
+    app.job_queue.run_repeating(expiration_sweeper, interval=600, first=30)
 
 
-# =========================
-# MAIN
-# =========================
-async def run():
-    # inicia webserver + bot
-    await start_web_server()
-
-    tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
-    tg_app.add_handler(CommandHandler("start", start))
-    tg_app.add_handler(CommandHandler("renovar", renovar))
-    tg_app.add_handler(CommandHandler("verificar", verificar))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    if PUBLIC_BASE_URL:
-        logger.info(f"Cadastre no MP a URL de webhook: {PUBLIC_BASE_URL.rstrip('/')}{MP_WEBHOOK_PATH}")
-    else:
-        logger.warning("PUBLIC_BASE_URL não definido. Você precisa disso para cadastrar o webhook no Mercado Pago.")
-
-    logger.info("Bot iniciado. Rodando polling...")
-    await tg_app.initialize()
-    await tg_app.start()
-    await tg_app.updater.start_polling()
-
-    # segura o processo vivo
-    while True:
-        await asyncio.sleep(3600)
+async def post_shutdown(app):
+    runner = app.bot_data.get("aio_runner")
+    if runner:
+        try:
+            await runner.cleanup()
+        except Exception:
+            pass
 
 
 def main():
-    asyncio.run(run())
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    logger.info("Bot iniciado. Rodando polling + webhook MP...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
