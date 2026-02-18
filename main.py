@@ -1,16 +1,17 @@
 import os
 import uuid
+import json
 import logging
 import asyncio
-from io import BytesIO
 from typing import Any, Dict, Optional, Tuple, Union
 
 import requests
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -21,8 +22,8 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "").strip()
 
-# Email padrão (mais seguro e menos problemático do que pedir CPF)
-# Se estiver vazio, cai no formato: seuemail+tg<ID>@gmail.com
+# (Opcional) Se quiser fixar um email real e estável:
+# Railway -> Variables: MP_PAYER_EMAIL_PADRAO=seuemail@...
 MP_PAYER_EMAIL_PADRAO = os.getenv("MP_PAYER_EMAIL_PADRAO", "").strip()
 
 if not BOT_TOKEN:
@@ -33,64 +34,68 @@ if not MP_ACCESS_TOKEN:
 # =========================
 # LOG
 # =========================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 # =========================
-# MENUS / PLANOS
+# PLANOS (INICIAL + PROMO)
 # =========================
-
-# MENU INICIAL (valores “originais” + opção 4 promocional separado)
-MENU = (
-    "🔥 Bem-vindo! Você acaba de garantir acesso ao conteúdo mais exclusivo e atualizado do momento!\n"
-    "Centenas de pessoas já estão dentro aproveitando todos os benefícios. Agora é a sua vez!\n\n"
-    "Escolha abaixo o plano ideal e entre imediatamente no grupo privado:\n\n"
-    "1️⃣ Plano Semanal — R$19,90\n"
-    "2️⃣ Plano Mensal — R$29,90\n"
-    "3️⃣ Plano Anual — R$39,90\n\n"
-    "4️⃣ 🎁 Plano Anual Promocional — R$29,99\n\n"
-    "Digite apenas o número do plano desejado."
-)
-
-# MENU DE RENOVAÇÃO (só aparece quando você disparar manualmente ou via sua lógica de 24h)
-MENU_RENOVACAO = (
-    "🎁 MENU EXCLUSIVO DE RENOVAÇÃO (válido por 24 horas)\n\n"
-    "🔥 Oferta liberada por 24 horas:\n\n"
-    "1️⃣ Plano Semanal — R$10,90\n"
-    "2️⃣ Plano Mensal — R$15,90\n"
-    "3️⃣ Plano Anual — R$19,90\n\n"
-    "Esses valores expiram em 24 horas."
-)
-
-PLANOS_INICIAIS = {
+PLANS_INITIAL = {
     "1": ("Plano Semanal", 19.90),
     "2": ("Plano Mensal", 29.90),
     "3": ("Plano Anual", 39.90),
     "4": ("Plano Anual Promocional", 29.99),
 }
 
-PLANOS_RENOVACAO = {
+# =========================
+# PLANOS (RENOVAÇÃO - 24H)
+# =========================
+PLANS_RENEWAL = {
     "1": ("Plano Semanal (Renovação)", 10.90),
     "2": ("Plano Mensal (Renovação)", 15.90),
     "3": ("Plano Anual (Renovação)", 19.90),
 }
 
-# Por padrão, o bot usa o MENU INICIAL.
-# Você pode trocar para renovação guardando uma flag em user_data quando sua lógica de 24h disparar.
-USER_MODE_KEY = "menu_mode"  # "initial" | "renew"
+# =========================
+# TEXTOS
+# =========================
+WELCOME_TEXT = (
+    "🔥 Bem-vindo! Você acaba de garantir acesso ao conteúdo mais exclusivo e atualizado do momento!\n"
+    "Centenas de pessoas já estão dentro aproveitando todos os benefícios. Agora é a sua vez!\n\n"
+    "Escolha abaixo o plano ideal e entre imediatamente no grupo privado:"
+)
 
+RENEW_TEXT = (
+    "🎁 MENU EXCLUSIVO DE RENOVAÇÃO (válido por 24 horas)\n\n"
+    "🔥 Oferta liberada por 24 horas:\n"
+    "Escolha abaixo o plano de renovação com desconto:"
+)
+
+# =========================
+# UI: BOTÕES
+# =========================
+def keyboard_initial() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton("Plano Semanal – R$19,90", callback_data="buy:initial:1")],
+        [InlineKeyboardButton("Plano Mensal – R$29,90", callback_data="buy:initial:2")],
+        [InlineKeyboardButton("Plano Anual – R$39,90", callback_data="buy:initial:3")],
+        [InlineKeyboardButton("🎁 Plano Anual Promocional – R$29,99", callback_data="buy:initial:4")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def keyboard_renewal() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton("Plano Semanal – R$10,90", callback_data="buy:renew:1")],
+        [InlineKeyboardButton("Plano Mensal – R$15,90", callback_data="buy:renew:2")],
+        [InlineKeyboardButton("Plano Anual – R$19,90", callback_data="buy:renew:3")],
+        [InlineKeyboardButton("⬅️ Voltar ao menu", callback_data="nav:initial")],
+    ]
+    return InlineKeyboardMarkup(kb)
 
 # =========================
 # MERCADO PAGO: GERAR PIX
 # =========================
 def gerar_pix(valor: float, descricao: str, payer_email: str) -> Tuple[int, Union[Dict[str, Any], str]]:
-    """
-    Cria um pagamento PIX no Mercado Pago via API (requests).
-    Retorna (status_code, response_json_ou_texto)
-    """
     url = "https://api.mercadopago.com/v1/payments"
     idempotency_key = str(uuid.uuid4())
 
@@ -104,224 +109,197 @@ def gerar_pix(valor: float, descricao: str, payer_email: str) -> Tuple[int, Unio
         "transaction_amount": float(valor),
         "description": descricao,
         "payment_method_id": "pix",
-        "payer": {
-            "email": payer_email,
-        },
+        "payer": {"email": payer_email},
     }
 
-    # Timeout curto pra não “prender” o bot.
-    # Mesmo assim, se falhar, a gente mostra o erro.
     try:
-        logger.info(f"[MP] Criando PIX: valor={valor} descricao='{descricao}' email='{payer_email}'")
         resp = requests.post(url, headers=headers, json=payload, timeout=20)
-
         try:
             data = resp.json()
         except Exception:
             data = resp.text
-
-        logger.info(f"[MP] Resposta status={resp.status_code}")
         return resp.status_code, data
-
     except Exception as e:
-        logger.exception("[MP] Erro criando PIX")
         return 0, {"error": str(e)}
 
+def extrair_pix_copia_cola(mp_response: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    if not isinstance(mp_response, dict):
+        return None, None
 
-def extrair_pix(mp_response: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
-    """
-    Extrai:
-    - qr_code (copia e cola)
-    - qr_code_base64
-    - ticket_url
-    - payment_id
-    """
-    poi = (mp_response.get("point_of_interaction") or {})
-    tx = (poi.get("transaction_data") or {})
+    poi = mp_response.get("point_of_interaction") or {}
+    tx = poi.get("transaction_data") or {}
 
     qr_code = tx.get("qr_code")
-    qr_code_base64 = tx.get("qr_code_base64")
     ticket_url = tx.get("ticket_url")
-    payment_id = mp_response.get("id")
+    return qr_code, ticket_url
 
-    return qr_code, qr_code_base64, ticket_url, payment_id
-
+def payer_email_for_user(user_id: int) -> str:
+    # Melhor forma “sem dor de cabeça”: use um email real via ENV.
+    if MP_PAYER_EMAIL_PADRAO:
+        return MP_PAYER_EMAIL_PADRAO
+    # Fallback: alias no gmail (formato válido). Troque "braoviana" se quiser.
+    return f"braoviana+tg{user_id}@gmail.com"
 
 # =========================
-# HELPERS TELEGRAM
+# HELPERS
 # =========================
-def _is_start_text(texto: str) -> bool:
-    t = (texto or "").strip().lower()
-    return t in ("/start", "start", "iniciar", "menu")
-
-
-def _get_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
-    return context.user_data.get(USER_MODE_KEY, "initial")
-
-
-def _get_plans_by_mode(mode: str):
-    return PLANOS_RENOVACAO if mode == "renew" else PLANOS_INICIAIS
-
-
-def _get_menu_by_mode(mode: str) -> str:
-    return MENU_RENOVACAO if mode == "renew" else MENU
-
+def is_start_like(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return t in ("/start", "start", "menu", "iniciar", "começar", "comecar")
 
 # =========================
 # HANDLERS
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Sempre inicia no menu inicial
-    context.user_data[USER_MODE_KEY] = "initial"
-    await update.message.reply_text(MENU)
-
+    context.user_data.clear()
+    await update.message.reply_text(WELCOME_TEXT, reply_markup=keyboard_initial())
 
 async def renovar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Comando manual pra você testar o menu de renovação.
-    Depois você liga isso automaticamente quando faltar 24h.
-    """
-    context.user_data[USER_MODE_KEY] = "renew"
-    await update.message.reply_text(MENU_RENOVACAO)
+    # Você pode manter esse comando para testes.
+    # No seu fluxo final, ele só deve aparecer quando faltar 24h (seu sweeper faz isso).
+    context.user_data.clear()
+    await update.message.reply_text(RENEW_TEXT, reply_markup=keyboard_renewal())
 
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mode = _get_mode(context)
-    await update.message.reply_text(_get_menu_by_mode(mode))
+    data = query.data or ""
 
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    texto = (update.message.text or "").strip()
-
-    # Se digitarem Start/Oi/etc, mostra menu
-    if _is_start_text(texto) or texto.lower() in ("oi", "ola", "olá"):
-        await menu(update, context)
+    # Navegação simples
+    if data == "nav:initial":
+        context.user_data.clear()
+        await query.edit_message_text(WELCOME_TEXT, reply_markup=keyboard_initial())
         return
 
-    # trava por usuário para evitar vários PIX simultâneos
+    # Compra: buy:<initial|renew>:<key>
+    if not data.startswith("buy:"):
+        await query.edit_message_text("❌ Ação inválida. Use /start novamente.")
+        return
+
+    parts = data.split(":")
+    if len(parts) != 3:
+        await query.edit_message_text("❌ Ação inválida. Use /start novamente.")
+        return
+
+    _, mode, key = parts
+
+    plans = PLANS_INITIAL if mode == "initial" else PLANS_RENEWAL
+    if key not in plans:
+        await query.edit_message_text("❌ Opção inválida. Use /start novamente.")
+        return
+
+    # trava por usuário para evitar vários pix simultâneos
     if context.user_data.get("gerando_pix"):
-        await update.message.reply_text("⏳ Já estou gerando um PIX pra você. Aguarde alguns segundos…")
-        return
-
-    mode = _get_mode(context)
-    planos = _get_plans_by_mode(mode)
-    menu_txt = _get_menu_by_mode(mode)
-
-    # opção inválida
-    if texto not in planos:
-        if mode == "renew":
-            await update.message.reply_text("❌ Opção inválida. Digite 1, 2 ou 3.\n\n" + menu_txt)
-        else:
-            await update.message.reply_text("❌ Opção inválida. Digite 1, 2, 3 ou 4.\n\n" + menu_txt)
+        await query.message.reply_text("⏳ Já estou gerando um PIX pra você. Aguarde alguns segundos…")
         return
 
     context.user_data["gerando_pix"] = True
     try:
-        nome_plano, valor = planos[texto]
-        user = update.effective_user
+        nome_plano, valor = plans[key]
+        user = query.from_user
 
-        # Email padrão seguro:
-        # 1) se tiver MP_PAYER_EMAIL_PADRAO, usa ele
-        # 2) senão, usa alias +tg<ID> no seu gmail
-        if MP_PAYER_EMAIL_PADRAO:
-            payer_email = MP_PAYER_EMAIL_PADRAO
-        else:
-            # Troque "braoviana" aqui se quiser — mas o ideal é usar MP_PAYER_EMAIL_PADRAO nas variáveis.
-            payer_email = f"braoviana+tg{user.id}@gmail.com"
+        # Atualiza mensagem para feedback instantâneo
+        try:
+            await query.edit_message_text(
+                f"⏳ Gerando seu PIX...\n\nPlano: {nome_plano}\nValor: R${valor:.2f}"
+            )
+        except Exception:
+            # se não der pra editar (ex.: mensagem antiga), só segue
+            pass
 
-        await update.message.reply_text("⏳ Gerando seu PIX...")
+        email = payer_email_for_user(user.id)
 
-        descricao = f"{nome_plano} - Prime VIP"
-
-        # roda requests fora do loop async (evita travar o bot)
         status, pagamento = await asyncio.to_thread(
             gerar_pix,
-            valor,
-            descricao,
-            payer_email,
+            float(valor),
+            f"{nome_plano} - Prime VIP",
+            email,
         )
 
-        if status not in (200, 201):
-            await update.message.reply_text(
+        if status not in (200, 201) or not isinstance(pagamento, dict):
+            await query.message.reply_text(
                 "❌ Erro ao gerar Pix. Tente novamente.\n\n"
                 f"Status: {status}\n"
-                f"Resposta: {str(pagamento)[:3000]}"
+                f"Resposta: {str(pagamento)[:2500]}"
             )
             return
 
-        if not isinstance(pagamento, dict):
-            await update.message.reply_text(
-                "❌ Resposta inesperada do Mercado Pago (não veio JSON).\n\n"
-                f"Resposta: {str(pagamento)[:3000]}"
-            )
-            return
-
-        qr_code, qr_base64, ticket_url, payment_id = extrair_pix(pagamento)
+        qr_code, ticket_url = extrair_pix_copia_cola(pagamento)
 
         if not qr_code:
-            await update.message.reply_text(
-                "❌ O Mercado Pago não retornou o 'qr_code' (copia e cola).\n\n"
-                f"Resposta: {str(pagamento)[:3000]}"
+            await query.message.reply_text(
+                "❌ O Mercado Pago não retornou o código Pix (copia e cola).\n\n"
+                f"Resposta: {str(pagamento)[:2500]}"
             )
             return
 
-        # 1) Envia um resumo no chat
+        # Mensagem SEM Markdown para facilitar copiar
         msg = (
             "✅ PIX GERADO COM SUCESSO!\n\n"
-            f"📦 Plano: {nome_plano}\n"
-            f"💰 Valor: R${valor:.2f}\n"
+            f"Plano: {nome_plano}\n"
+            f"Valor: R${valor:.2f}\n\n"
+            "📋 Copia e cola:\n"
+            f"{qr_code}\n\n"
         )
-        if payment_id:
-            msg += f"🧾 ID do pagamento: {payment_id}\n"
         if ticket_url:
-            msg += f"\n🔗 Link do QR: {ticket_url}\n"
+            msg += f"🔗 QR Code: {ticket_url}\n\n"
+        msg += "⏳ Após pagar, aguarde a confirmação."
 
-        msg += (
-            "\n📄 Copia e cola: enviei também em arquivo .txt (mais fácil copiar no celular).\n"
-            "⏳ Após pagar, aguarde a confirmação."
-        )
-
-        await update.message.reply_text(msg)
-
-        # 2) Envia SEMPRE o copia-e-cola em TXT (pra não depender do copiar do Telegram)
-        try:
-            bio = BytesIO(qr_code.encode("utf-8"))
-            bio.name = "pix_copia_e_cola.txt"
-            await update.message.reply_document(document=bio, caption="📄 PIX Copia e Cola (arquivo)")
-        except Exception:
-            # Se falhar o documento, manda o copia-e-cola no texto mesmo (fallback)
-            logger.exception("[TG] Falha ao enviar arquivo .txt. Enviando fallback em texto.")
-            await update.message.reply_text(
-                "📄 PIX Copia e Cola (fallback):\n\n" + qr_code
-            )
+        await query.message.reply_text(msg)
 
     finally:
         context.user_data["gerando_pix"] = False
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+
+    # Qualquer "start/menu/oi" reseta e mostra o menu correto (não gera pix)
+    if is_start_like(text) or text.lower() in ("oi", "ola", "olá"):
+        context.user_data.clear()
+        await update.message.reply_text(WELCOME_TEXT, reply_markup=keyboard_initial())
+        return
+
+    # Se a pessoa digitar números mesmo assim, a gente ajuda (fallback)
+    if text in PLANS_INITIAL:
+        # simula clique no botão inicial
+        fake_update = update
+        await update.message.reply_text("👆 Para facilitar, escolha clicando em um botão abaixo:", reply_markup=keyboard_initial())
+        return
+
+    if text in PLANS_RENEWAL:
+        await update.message.reply_text("👆 Para facilitar, escolha clicando em um botão abaixo:", reply_markup=keyboard_renewal())
+        return
+
+    # Caso geral
+    await update.message.reply_text("Para escolher, clique em um dos botões abaixo 👇", reply_markup=keyboard_initial())
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Erro no bot:", exc_info=context.error)
     try:
-        if isinstance(update, Update) and update.message:
-            await update.message.reply_text("❌ Ocorreu um erro interno. Tente novamente em alguns segundos.")
+        if isinstance(update, Update) and update.effective_chat:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="❌ Ocorreu um erro interno. Tente novamente em alguns segundos.",
+            )
     except Exception:
         pass
 
-
+# =========================
+# MAIN
+# =========================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu", menu))
-    app.add_handler(CommandHandler("renovar", renovar))  # teste manual do menu de renovação
-
+    app.add_handler(CommandHandler("renovar", renovar))  # opcional (teste/manual)
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.add_error_handler(error_handler)
 
     logger.info("Bot iniciado. Rodando polling...")
     app.run_polling(close_loop=False)
-
 
 if __name__ == "__main__":
     main()
