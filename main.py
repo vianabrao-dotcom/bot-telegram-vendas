@@ -2,8 +2,6 @@ import os
 import json
 import time
 import uuid
-import hmac
-import hashlib
 import logging
 import sqlite3
 import threading
@@ -43,6 +41,9 @@ GROUP_INVITE_LINK = os.getenv("GROUP_INVITE_LINK", "").strip()  # ex: https://t.
 
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()  # ex: "123456789"
 TEST_MODE = os.getenv("TEST_MODE", "false").strip().lower() in ("1", "true", "yes", "on")
+
+# Suporte (URL direta para contato)
+SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()  # ex: https://t.me/seuuser?text=...
 
 # Webhook (opcional) - recomendado usar token na URL
 MP_WEBHOOK_URL = os.getenv("MP_WEBHOOK_URL", "").strip()        # ex: https://seuapp.up.railway.app/mp/webhook?token=SECRETO
@@ -89,6 +90,11 @@ def db_conn():
     conn.row_factory = sqlite3.Row
     return conn
 
+def _column_exists(cur, table: str, col: str) -> bool:
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in cur.fetchall()]
+    return col in cols
+
 def db_init():
     conn = db_conn()
     cur = conn.cursor()
@@ -104,10 +110,19 @@ def db_init():
             created_at INTEGER,
             paid_at INTEGER,
             expires_at INTEGER,
-            last_interaction_at INTEGER
+            last_interaction_at INTEGER,
+            pix_copia_cola TEXT,
+            pix_ticket_url TEXT
         )
         """
     )
+    conn.commit()
+
+    # Migração segura (caso você já tenha o DB antigo sem as novas colunas)
+    if not _column_exists(cur, "users", "pix_copia_cola"):
+        cur.execute("ALTER TABLE users ADD COLUMN pix_copia_cola TEXT")
+    if not _column_exists(cur, "users", "pix_ticket_url"):
+        cur.execute("ALTER TABLE users ADD COLUMN pix_ticket_url TEXT")
     conn.commit()
     conn.close()
 
@@ -118,7 +133,6 @@ def upsert_user(telegram_id: int, **fields):
     now = int(time.time())
     fields.setdefault("last_interaction_at", now)
 
-    # existe?
     cur.execute("SELECT telegram_id FROM users WHERE telegram_id = ?", (telegram_id,))
     exists = cur.fetchone() is not None
 
@@ -134,6 +148,8 @@ def upsert_user(telegram_id: int, **fields):
             "paid_at": None,
             "expires_at": None,
             "last_interaction_at": now,
+            "pix_copia_cola": None,
+            "pix_ticket_url": None,
         }
         base.update(fields)
         cols = ", ".join(base.keys())
@@ -154,6 +170,14 @@ def get_user(telegram_id: int):
     conn.close()
     return row
 
+def get_user_by_payment_id(payment_id: str):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE payment_id = ?", (payment_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
 def set_active(telegram_id: int, plan_key: str, duration_days: int):
     now = int(time.time())
     expires = now + duration_days * 24 * 60 * 60
@@ -162,6 +186,7 @@ def set_active(telegram_id: int, plan_key: str, duration_days: int):
         status="active",
         paid_at=now,
         expires_at=expires,
+        payment_status="approved",
     )
 
 def clear_pending(telegram_id: int):
@@ -172,16 +197,13 @@ def clear_pending(telegram_id: int):
         payment_id=None,
         payment_status=None,
         amount=None,
+        pix_copia_cola=None,
+        pix_ticket_url=None,
     )
 
 # ----------------------------
 # Helpers
 # ----------------------------
-def is_admin(telegram_id: int) -> bool:
-    if not ADMIN_TELEGRAM_ID:
-        return False
-    return str(telegram_id) == str(ADMIN_TELEGRAM_ID)
-
 def human_time_left(seconds: int) -> str:
     if seconds <= 0:
         return "expirado"
@@ -228,7 +250,6 @@ async def enforce_expiration(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if user["status"] == "active" and user["expires_at"]:
         now = int(time.time())
         if user["expires_at"] <= now:
-            # expira
             upsert_user(tid, status="expired")
             await safe_remove_from_group(context, tid)
             try:
@@ -241,6 +262,31 @@ async def enforce_expiration(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
             except Exception:
                 pass
+
+def pix_action_keyboard(payment_id: str, ticket_url: str) -> InlineKeyboardMarkup:
+    """
+    Botões:
+    - Copiar Pix: reenvia o copia-e-cola (mensagem limpa)
+    - Já paguei: verifica status no MP e libera se aprovado
+    - Abrir QR: abre link do QR
+    - Suporte: link direto
+    """
+    row1 = [
+        InlineKeyboardButton("📋 Copiar Pix", callback_data=f"pixcopy:{payment_id}"),
+        InlineKeyboardButton("✅ Já paguei", callback_data=f"pixcheck:{payment_id}"),
+    ]
+
+    row2 = []
+    if ticket_url:
+        row2.append(InlineKeyboardButton("🌐 Abrir QR Code", url=ticket_url))
+    if SUPPORT_URL:
+        row2.append(InlineKeyboardButton("🆘 Suporte", url=SUPPORT_URL))
+
+    keyboard = [row1]
+    if row2:
+        keyboard.append(row2)
+
+    return InlineKeyboardMarkup(keyboard)
 
 # ----------------------------
 # Menus
@@ -290,13 +336,6 @@ def mp_headers():
     }
 
 def mp_create_pix_payment(amount: float, description: str, payer_email: str):
-    """
-    Cria pagamento PIX via API.
-    Retorna dict com:
-      - id (payment id)
-      - copia_cola (qr_code)
-      - ticket_url (link para QR)
-    """
     if not MP_ACCESS_TOKEN:
         raise RuntimeError("MP_ACCESS_TOKEN não configurado.")
 
@@ -304,36 +343,37 @@ def mp_create_pix_payment(amount: float, description: str, payer_email: str):
         "transaction_amount": float(amount),
         "description": description,
         "payment_method_id": "pix",
-        "payer": {
-            "email": payer_email
-        }
+        "payer": {"email": payer_email},
     }
 
-    # idempotency evita duplicar pagamento em retries
     idem = str(uuid.uuid4())
     headers = mp_headers()
     headers["X-Idempotency-Key"] = idem
 
-    r = requests.post("https://api.mercadopago.com/v1/payments", headers=headers, data=json.dumps(payload), timeout=20)
+    r = requests.post(
+        "https://api.mercadopago.com/v1/payments",
+        headers=headers,
+        data=json.dumps(payload),
+        timeout=20,
+    )
     r.raise_for_status()
     data = r.json()
 
     pid = str(data.get("id"))
     poi = (data.get("point_of_interaction") or {}).get("transaction_data") or {}
-    copia_cola = poi.get("qr_code")  # copia e cola
-    ticket_url = poi.get("ticket_url")  # link QR
+    copia_cola = poi.get("qr_code")
+    ticket_url = poi.get("ticket_url")
 
-    return {
-        "id": pid,
-        "copia_cola": copia_cola,
-        "ticket_url": ticket_url,
-        "raw": data,
-    }
+    return {"id": pid, "copia_cola": copia_cola, "ticket_url": ticket_url, "raw": data}
 
 def mp_get_payment(payment_id: str):
     if not MP_ACCESS_TOKEN:
         raise RuntimeError("MP_ACCESS_TOKEN não configurado.")
-    r = requests.get(f"https://api.mercadopago.com/v1/payments/{payment_id}", headers=mp_headers(), timeout=20)
+    r = requests.get(
+        f"https://api.mercadopago.com/v1/payments/{payment_id}",
+        headers=mp_headers(),
+        timeout=20,
+    )
     r.raise_for_status()
     return r.json()
 
@@ -342,7 +382,6 @@ def mp_get_payment(payment_id: str):
 # ----------------------------
 def test_generate_pix_like(amount: float, description: str):
     fake_payment_id = f"TEST-{uuid.uuid4().hex[:10]}"
-    # string "copia e cola" fake parecida
     copia = (
         "00020126"
         "580014br.gov.bcb.pix"
@@ -357,13 +396,24 @@ def test_generate_pix_like(amount: float, description: str):
         + "21mpqprinter"
         + uuid.uuid4().hex[:12]
     )
-    ticket_url = "https://www.mercadopago.com.br/"  # placeholder
-    return {
-        "id": fake_payment_id,
-        "copia_cola": copia,
-        "ticket_url": ticket_url,
-        "raw": {"test": True, "description": description},
-    }
+    ticket_url = "https://www.mercadopago.com.br/"
+    return {"id": fake_payment_id, "copia_cola": copia, "ticket_url": ticket_url, "raw": {"test": True, "description": description}}
+
+# ----------------------------
+# Ações pós-aprovação
+# ----------------------------
+async def grant_access(context: ContextTypes.DEFAULT_TYPE, tid: int):
+    if GROUP_INVITE_LINK:
+        await context.bot.send_message(
+            chat_id=tid,
+            text=f"✅ Pagamento confirmado!\n\n🔗 Acesse o grupo privado: {GROUP_INVITE_LINK}",
+            disable_web_page_preview=True
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=tid,
+            text="✅ Pagamento confirmado! Porém o link do grupo não está configurado. Fale com o suporte.",
+        )
 
 # ----------------------------
 # Telegram Handlers
@@ -376,11 +426,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tid = user.id
-    upsert_user(tid, status=get_user(tid)["status"] if get_user(tid) else "new")
+    existing = get_user(tid)
+    upsert_user(tid, status=existing["status"] if existing else "new")
 
     row = get_user(tid)
 
-    # Se ativo e dentro da janela de renovação -> menu renovação
     if within_renewal_window(row):
         await update.message.reply_text(
             build_welcome_text_renewal(row),
@@ -390,7 +440,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Se ativo e fora da janela -> mostrar status e opção "ver grupo"
     if row and row["status"] == "active" and row["expires_at"]:
         now = int(time.time())
         remaining = max(0, int(row["expires_at"]) - now)
@@ -402,11 +451,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"🔗 Acesse o grupo privado: {GROUP_INVITE_LINK}\n"
         else:
             text += "⚠️ O link do grupo ainda não foi configurado.\n"
-        text += "\nSe quiser renovar quando faltar 24h, este menu aparecerá automaticamente aqui no /start."
+        text += "\nQuando faltar 24h, o menu de renovação com desconto aparecerá aqui no /start."
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
         return
 
-    # Caso contrário -> menu inicial
     await update.message.reply_text(
         build_welcome_text_initial(),
         reply_markup=menu_initial_keyboard(),
@@ -433,7 +481,6 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     row = get_user(tid)
     if mode == "renew":
-        # Segurança: só permitir renovação dentro da janela
         if not within_renewal_window(row):
             await query.edit_message_text(
                 "⚠️ O menu de renovação só fica disponível nas últimas 24 horas da assinatura.\n\nUse /start para ver as opções corretas."
@@ -456,12 +503,10 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     amount = float(plan["amount"])
     label = plan["label"]
 
-    # "Gerando pix..."
     await query.edit_message_text(
         f"⏳ Gerando seu PIX...\n\nPlano: {label}\nValor: R${amount:.2f}".replace(".", ",")
     )
 
-    # Payer email (mais seguro: usar um email padrão do seu ambiente; se vazio, usa placeholder)
     payer_email = MP_PAYER_EMAIL_PADRAO or "cliente@example.com"
 
     try:
@@ -471,8 +516,8 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             payment = mp_create_pix_payment(amount, description, payer_email)
 
         payment_id = str(payment["id"])
-        copia_cola = payment.get("copia_cola") or ""
-        ticket_url = payment.get("ticket_url") or ""
+        copia_cola = (payment.get("copia_cola") or "").strip()
+        ticket_url = (payment.get("ticket_url") or "").strip()
 
         upsert_user(
             tid,
@@ -481,9 +526,10 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             payment_id=payment_id,
             payment_status="pending",
             amount=amount,
+            pix_copia_cola=copia_cola,
+            pix_ticket_url=ticket_url,
         )
 
-        # Mensagem final para o cliente
         extra_test = ""
         if TEST_MODE:
             extra_test = (
@@ -502,7 +548,7 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if ticket_url:
             msg += f"🔗 *QR Code:* {ticket_url}\n\n"
 
-        msg += "⏳ Após pagar, aguarde a confirmação."
+        msg += "⬇️ Use os botões abaixo para copiar ou confirmar o pagamento."
         msg += extra_test
 
         await context.bot.send_message(
@@ -510,6 +556,7 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             text=msg,
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
+            reply_markup=pix_action_keyboard(payment_id, ticket_url),
         )
 
     except Exception as e:
@@ -519,10 +566,93 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             chat_id=tid,
             text=(
                 "❌ Não consegui gerar o PIX agora.\n\n"
-                "Tente novamente em instantes com /start.\n"
-                f"(Detalhe técnico: {str(e)})"
+                "Tente novamente em instantes com /start."
             ),
         )
+
+async def pix_copy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    data = query.data or ""
+    _, payment_id = data.split(":", 1)
+
+    row = get_user_by_payment_id(payment_id)
+    if not row or not row["pix_copia_cola"]:
+        await query.message.reply_text("❌ Não encontrei esse PIX. Gere um novo com /start.")
+        return
+
+    pix = row["pix_copia_cola"].strip()
+    await query.message.reply_text(
+        "📋 *Pix Copia e Cola*\n"
+        "_(toque e segure para copiar)_\n\n"
+        f"`{pix}`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def pix_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer("Verificando...")
+
+    data = query.data or ""
+    _, payment_id = data.split(":", 1)
+
+    row = get_user_by_payment_id(payment_id)
+    if not row:
+        await query.message.reply_text("❌ Não encontrei esse pagamento. Gere um novo com /start.")
+        return
+
+    tid = int(row["telegram_id"])
+
+    # TEST_MODE: pode orientar ou aprovar automaticamente
+    if TEST_MODE:
+        await query.message.reply_text("🧪 Modo teste: para aprovar, envie /aprovar_teste.")
+        return
+
+    try:
+        mp = mp_get_payment(payment_id)
+        status = (mp.get("status") or "").lower()
+    except Exception:
+        await query.message.reply_text("⚠️ Não consegui consultar agora. Tente novamente em instantes.")
+        return
+
+    if status == "approved":
+        plan_key = row["plan_key"]
+        if plan_key in PLANS_INITIAL:
+            duration_days = PLANS_INITIAL[plan_key]["duration_days"]
+            label = PLANS_INITIAL[plan_key]["label"]
+        elif plan_key in PLANS_RENEWAL:
+            duration_days = PLANS_RENEWAL[plan_key]["duration_days"]
+            label = PLANS_RENEWAL[plan_key]["label"]
+        else:
+            duration_days = 7
+            label = "Plano"
+
+        # ativa e libera
+        set_active(tid, plan_key, duration_days)
+        await safe_remove_from_group(context, tid)
+        await grant_access(context, tid)
+
+        await query.message.reply_text(
+            f"✅ Pagamento confirmado!\nPlano: {label}\n\nAcesso liberado ✅",
+            disable_web_page_preview=True
+        )
+        return
+
+    if status in ("pending", "in_process"):
+        await query.message.reply_text(
+            "⏳ Ainda não recebi a confirmação do pagamento.\n"
+            "Se você acabou de pagar, aguarde 1–3 minutos e toque em ✅ Já paguei novamente."
+        )
+        return
+
+    # outros status: rejected/cancelled/refunded/charged_back etc.
+    upsert_user(tid, payment_status=status)
+    await query.message.reply_text(f"❌ Pagamento não aprovado (status: {status}). Gere um novo PIX com /start.")
 
 async def aprovar_teste(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Aprova o pagamento pendente no modo TESTE, sem MP."""
@@ -539,11 +669,10 @@ async def aprovar_teste(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     row = get_user(tid)
     if not row or row["status"] != "pending":
-        await update.message.reply_text("⚠️ Não encontrei pagamento pendente para aprovar. Use /start e gere um PIX primeiro.")
+        await update.message.reply_text("⚠️ Não encontrei pagamento pendente. Use /start e gere um PIX primeiro.")
         return
 
     plan_key = row["plan_key"]
-    # plano pode ser inicial ou renovação; duração vem do "label" correto
     if plan_key in PLANS_INITIAL:
         duration_days = PLANS_INITIAL[plan_key]["duration_days"]
         label = PLANS_INITIAL[plan_key]["label"]
@@ -551,29 +680,19 @@ async def aprovar_teste(update: Update, context: ContextTypes.DEFAULT_TYPE):
         duration_days = PLANS_RENEWAL[plan_key]["duration_days"]
         label = PLANS_RENEWAL[plan_key]["label"]
     else:
-        await update.message.reply_text("❌ Plano inválido no seu pedido. Use /start novamente.")
+        await update.message.reply_text("❌ Plano inválido. Use /start novamente.")
         clear_pending(tid)
         return
 
-    # Ativa assinatura e limpa status de pagamento
     set_active(tid, plan_key, duration_days)
-    upsert_user(tid, payment_status="approved")
-
-    # Se já tinha sido removido/banido antes, garante unban
     await safe_remove_from_group(context, tid)
+    await grant_access(context, tid)
 
-    text = (
-        "✅ *PAGAMENTO APROVADO (TESTE)*\n\n"
-        f"Plano: *{label}*\n"
-        f"Validade: *{duration_days} dias*\n\n"
+    await update.message.reply_text(
+        f"✅ *PAGAMENTO APROVADO (TESTE)*\n\nPlano: *{label}*\nValidade: *{duration_days} dias*\n\nAcesso liberado ✅",
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True
     )
-    if GROUP_INVITE_LINK:
-        text += f"🔗 Entre no grupo privado: {GROUP_INVITE_LINK}\n\n"
-    else:
-        text += "⚠️ Link do grupo não configurado (GROUP_INVITE_LINK).\n\n"
-
-    text += "Se precisar, use /start para ver seu status."
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await enforce_expiration(update, context)
@@ -625,7 +744,6 @@ class MPWebhookHandler(BaseHTTPRequestHandler):
             raw = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
             payload = json.loads(raw or "{}")
 
-            # MP costuma enviar: { "type": "payment", "data": { "id": "123" } }
             ptype = payload.get("type")
             data = payload.get("data") or {}
             mp_id = data.get("id")
@@ -633,74 +751,44 @@ class MPWebhookHandler(BaseHTTPRequestHandler):
             if ptype != "payment" or not mp_id:
                 return self._send(200, "ignored")
 
-            # Busca detalhes do pagamento
             payment = mp_get_payment(str(mp_id))
-            status = payment.get("status")
-            ext_ref = payment.get("external_reference")  # se você usar isso no futuro
+            status = (payment.get("status") or "").lower()
 
-            # Aqui a gente precisa mapear payment_id -> telegram_id.
-            # Neste projeto, gravamos payment_id quando geramos o pix.
-            conn = db_conn()
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM users WHERE payment_id = ?", (str(mp_id),))
-            row = cur.fetchone()
-            conn.close()
-
+            row = get_user_by_payment_id(str(mp_id))
             if not row:
                 return self._send(200, "payment not mapped")
 
-            telegram_id = int(row["telegram_id"])
+            tid = int(row["telegram_id"])
             plan_key = row["plan_key"]
 
-            # Aprovação
             if status == "approved":
-                # Define duração conforme plan_key
                 if plan_key in PLANS_INITIAL:
                     duration_days = PLANS_INITIAL[plan_key]["duration_days"]
-                    label = PLANS_INITIAL[plan_key]["label"]
                 elif plan_key in PLANS_RENEWAL:
                     duration_days = PLANS_RENEWAL[plan_key]["duration_days"]
-                    label = PLANS_RENEWAL[plan_key]["label"]
                 else:
                     duration_days = 7
-                    label = "Plano"
 
-                set_active(telegram_id, plan_key, duration_days)
-                upsert_user(telegram_id, payment_status="approved")
-
-                # Notifica usuário no Telegram (se possível)
-                try:
-                    app = getattr(self.server, "tg_app", None)
-                    if app:
-                        # unban/garante reentrada
-                        app.create_task(safe_remove_from_group(app.bot_data["context"], telegram_id))
-                except Exception:
-                    pass
-
+                set_active(tid, plan_key, duration_days)
+                # libera acesso
+                # como estamos fora do loop async, só marcamos no DB.
+                # o usuário pode tocar em "Já paguei" ou /start para receber o link.
+                upsert_user(tid, payment_status="approved")
             else:
-                # Mantém pending/atualiza status
-                upsert_user(telegram_id, payment_status=str(status))
+                upsert_user(tid, payment_status=status)
 
             return self._send(200, "ok")
 
-        except Exception as e:
+        except Exception:
             logger.exception("Erro no webhook MP")
             return self._send(500, "error")
 
 def start_webhook_server(application: Application):
-    """
-    Sobe um servidor HTTP nativo para receber webhook do Mercado Pago
-    (sem libs extras).
-    """
     if not MP_WEBHOOK_URL:
         logger.info("MP_WEBHOOK_URL não configurada — webhook não será iniciado.")
         return
 
-    # Inicia server em thread separada
     server = HTTPServer(("0.0.0.0", PORT), MPWebhookHandler)
-
-    # Truque: guardar application (não obrigatório)
-    server.tg_app = application
 
     def run():
         logger.info(f"Webhook server rodando em 0.0.0.0:{PORT} (path /mp/webhook)")
@@ -714,7 +802,6 @@ def start_webhook_server(application: Application):
 # ----------------------------
 async def any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await enforce_expiration(update, context)
-    # Se a pessoa mandar algo, só orienta
     if update.message:
         await update.message.reply_text("Use /start para ver os planos e gerar o PIX.")
 
@@ -732,14 +819,14 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("aprovar_teste", aprovar_teste))
     application.add_handler(CommandHandler("status", status))
+
     application.add_handler(CallbackQueryHandler(handle_buy_callback, pattern=r"^(buy|renew):"))
+    application.add_handler(CallbackQueryHandler(pix_copy_callback, pattern=r"^pixcopy:"))
+    application.add_handler(CallbackQueryHandler(pix_check_callback, pattern=r"^pixcheck:"))
+
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, any_text))
 
-    # Webhook MP (opcional): se você setar MP_WEBHOOK_URL, ele sobe o server
-    # Observação: o polling do Telegram continua normal.
-    # O Railway precisa de uma porta aberta: isso já atende.
     if MP_WEBHOOK_URL:
-        # só loga dica do token
         if MP_WEBHOOK_SECRET:
             logger.info("Webhook protegido por token. Garanta que a URL do MP tenha ?token=SEU_SEGREDO")
         else:
