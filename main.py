@@ -179,14 +179,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ *PIX GERADO COM SUCESSO!*\n\n"
         f"📦 Plano: *{nome_plano}*\n"
         f"💰 Valor: *R${valor:.2f}*\n\n"
-        f"📋 *Copia e cola:*\n"
-        f"`{qr_code}`\n\n"
+        "📋 Copia e cola:\n"
+        f"{qr_code}\n\n"
     )
     if ticket_url:
         msg += f"🔗 Link do QR: {ticket_url}\n\n"
 
     msg += "⏳ Após pagar, aguarde a confirmação."
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg)  # sem Markdown
 
 
 def main():
