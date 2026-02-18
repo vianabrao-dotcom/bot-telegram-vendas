@@ -187,106 +187,52 @@ def _user_in_renewal_window(u: dict) -> bool:
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if text.lower() in ("/start", "start"):
-        await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown")
-        return
+           await update.message.reply_text("⏳ Gerando seu PIX...")
 
-    db = db_load()
-    user = update.effective_user
-    u = get_user(db, user.id)
-    u["chat_id"] = update.effective_chat.id
+    descricao = f"{nome_plano} - Prime VIP"
 
-    # escolhe qual tabela de planos vale
-    if _user_in_renewal_window(u):
-        plans = PLANS_RENEWAL
-    else:
-        plans = PLANS_INITIAL
-
-    if text not in plans:
-        # se estiver na janela de renovação, mostra o menu de renovação; senão o inicial
-        if _user_in_renewal_window(u):
-            await update.message.reply_text(renewal_menu_text(u["renewal_offer_until"]), parse_mode="Markdown")
-        else:
-            await update.message.reply_text("❌ Opção inválida.\n\n" + WELCOME_TEXT, parse_mode="Markdown")
-        db_save(db)
-        return
-
-    plan = plans[text]
-    plan_code = text
-    amount = plan["amount"]
-    days = plan["days"]
-    plan_name = plan["name"]
-
-    # email válido e “neutro” (evita problema do telegram.local)
-    payer_email = f"user{user.id}@example.com"
-
-    await update.message.reply_text("⏳ Gerando seu PIX...")
-
-    external_reference = f"tg:{user.id}|plan:{plan_code}|renew:{'1' if plans is PLANS_RENEWAL else '0'}"
-    description = f"{plan_name} - Prime VIP"
-
-    status, payment = gerar_pix(
-        amount=amount,
-        description=description,
-        payer_email=payer_email,
-        payer_first_name=user.first_name or "Cliente",
-        payer_last_name=user.last_name or "VIP",
-        external_reference=external_reference,
+    # roda o requests.post fora do loop async (evita travar)
+    status, pagamento = await asyncio.to_thread(
+        gerar_pix,
+        valor,
+        descricao,
+        payer_email,
+        user.first_name or "Cliente",
+        user.last_name or "VIP",
     )
 
-    if status not in (200, 201) or not isinstance(payment, dict):
+    if status not in (200, 201):
+        # sem Markdown aqui pra não quebrar por caracteres do retorno
         await update.message.reply_text(
-            "❌ *Erro ao gerar Pix.*\n\n"
-            f"Status: `{status}`\n"
-            f"Resposta: `{str(payment)[:3500]}`",
-            parse_mode="Markdown",
+            f"❌ Erro ao gerar Pix. Tente novamente.\n\nStatus: {status}\nResposta: {str(pagamento)[:3500]}"
         )
         return
 
-    payment_id = str(payment.get("id", ""))
-    u["last_payment_id"] = payment_id
-    db["payments"][payment_id] = {
-        "payment_id": payment_id,
-        "user_id": user.id,
-        "chat_id": update.effective_chat.id,
-        "plan_name": plan_name,
-        "plan_days": days,
-        "amount": amount,
-        "created_at": _now_utc().isoformat(),
-        "status": payment.get("status"),
-    }
-    db_save(db)
-
-    qr_code, ticket_url = extrair_pix(payment)
+    qr_code, qr_base64, ticket_url = extrair_pix_copia_cola(pagamento)
 
     if not qr_code:
         await update.message.reply_text(
-            "⚠️ O pagamento foi criado, mas o Mercado Pago não retornou o *copia e cola*.\n\n"
-            "Abra pelo link abaixo e finalize por lá:\n"
-            f"{ticket_url or 'Sem link disponível no retorno.'}",
-            parse_mode="Markdown",
+            f"❌ Pix retornou formato inesperado.\n\nResposta: {str(pagamento)[:3500]}"
         )
         return
 
-    # 1) Mensagem bonita (resumo)
+    # Mensagem curta (sem Markdown pra evitar erro)
     msg = (
-        "✅ *PIX GERADO COM SUCESSO!*\n\n"
-        f"📦 Plano: *{plan_name}*\n"
-        f"💰 Valor: *R${amount:.2f}*\n\n"
-        "📋 *Copia e cola (enviei também em .txt para facilitar copiar):*\n"
-        "(veja a próxima mensagem)\n\n"
+        "✅ PIX GERADO COM SUCESSO!\n\n"
+        f"📦 Plano: {nome_plano}\n"
+        f"💰 Valor: R${valor:.2f}\n\n"
+        "📋 Copia e cola: (enviei também em arquivo .txt)\n"
     )
     if ticket_url:
-        msg += f"🔗 Link do QR: {ticket_url}\n\n"
-    msg += "⏳ Após pagar, aguarde a confirmação automática."
-    await update.message.reply_text(msg, parse_mode="Markdown")
+        msg += f"\n🔗 Link do QR: {ticket_url}\n"
 
-    # 2) Mensagem só com o código (mais fácil copiar)
-    await update.message.reply_text(qr_code)
+    await update.message.reply_text(msg)
 
-    # 3) Arquivo TXT com o código (dribla limitações de cópia em alguns chats)
+    # Sempre envia o copia-e-cola em TXT (não quebra e o cliente consegue copiar)
     bio = BytesIO(qr_code.encode("utf-8"))
     bio.name = "pix_copia_e_cola.txt"
-    await update.message.reply_document(InputFile(bio), caption="📎 Pix Copia e Cola (arquivo)")
+    await update.message.reply_document(document=bio, caption="📄 PIX Copia e Cola (arquivo)")
+
 
 # =========================
 # WEBHOOK HTTP (std lib)
