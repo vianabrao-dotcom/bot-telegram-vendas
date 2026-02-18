@@ -337,10 +337,14 @@ def mp_create_pix_payment(amount: float, description: str, payer_email: str):
     r = requests.post(
         "https://api.mercadopago.com/v1/payments",
         headers=headers,
-        data=json.dumps(payload),
+        json=payload,   # <- melhor que data=json.dumps
         timeout=20,
     )
-    r.raise_for_status()
+
+    # Se der erro, imprime a resposta do Mercado Pago (isso é o ouro)
+    if r.status_code >= 400:
+        raise RuntimeError(f"MP {r.status_code}: {r.text}")
+
     data = r.json()
 
     pid = str(data.get("id"))
@@ -349,6 +353,7 @@ def mp_create_pix_payment(amount: float, description: str, payer_email: str):
     ticket_url = poi.get("ticket_url")
 
     return {"id": pid, "copia_cola": copia_cola, "ticket_url": ticket_url, "raw": data}
+
 
 def mp_get_payment(payment_id: str):
     if not MP_ACCESS_TOKEN:
@@ -531,12 +536,30 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=pix_action_keyboard(payment_id, ticket_url),
         )
 
-    except Exception as e:
-        logger.exception("Erro ao gerar PIX")
-        clear_pending(tid)
-        await context.bot.send_message(
-            chat_id=tid,
-            text="❌ Não consegui gerar o PIX agora.\n\nTente novamente em instantes com /start.",
+   except Exception as e:
+    logger.exception("Erro ao gerar PIX")
+    clear_pending(tid)
+
+    # Mostra o erro real pro usuário (depois que estiver OK, você pode voltar pro modo “limpo”)
+    await context.bot.send_message(
+        chat_id=tid,
+        text=(
+            "❌ Não consegui gerar o PIX agora.\n\n"
+            "Detalhe técnico (para suporte):\n"
+            f"{str(e)}"
+        ),
+    )
+
+    # Se você tiver ADMIN_TELEGRAM_ID, também manda pra você
+    if ADMIN_TELEGRAM_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=int(ADMIN_TELEGRAM_ID),
+                text=f"⚠️ Erro ao gerar PIX para {tid}:\n{str(e)}",
+            )
+        except Exception:
+            pass
+
         )
 
 async def pix_copy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
