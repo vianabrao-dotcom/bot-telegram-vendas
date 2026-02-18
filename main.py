@@ -5,6 +5,7 @@ import uuid
 import logging
 import sqlite3
 import threading
+import html
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -42,12 +43,10 @@ GROUP_INVITE_LINK = os.getenv("GROUP_INVITE_LINK", "").strip()  # ex: https://t.
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()  # ex: "123456789"
 TEST_MODE = os.getenv("TEST_MODE", "false").strip().lower() in ("1", "true", "yes", "on")
 
-# Suporte (URL direta para contato)
 SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()  # ex: https://t.me/seuuser?text=...
 
-# Webhook (opcional) - recomendado usar token na URL
 MP_WEBHOOK_URL = os.getenv("MP_WEBHOOK_URL", "").strip()        # ex: https://seuapp.up.railway.app/mp/webhook?token=SECRETO
-MP_WEBHOOK_SECRET = os.getenv("MP_WEBHOOK_SECRET", "").strip()  # "SECRETO" (usado no token=)
+MP_WEBHOOK_SECRET = os.getenv("MP_WEBHOOK_SECRET", "").strip()  # "SECRETO"
 
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -63,7 +62,6 @@ logger = logging.getLogger("primevip")
 # ----------------------------
 # Planos / Regras
 # ----------------------------
-# Valores "iniciais" (entrada)
 PLANS_INITIAL = {
     "weekly": {"label": "Plano Semanal", "amount": 19.90, "duration_days": 7},
     "monthly": {"label": "Plano Mensal", "amount": 29.90, "duration_days": 30},
@@ -71,7 +69,6 @@ PLANS_INITIAL = {
     "annual_promo": {"label": "Plano Anual Promocional", "amount": 29.99, "duration_days": 365},
 }
 
-# Valores de renovação (desconto) – aparece somente nas 24h finais
 PLANS_RENEWAL = {
     "weekly": {"label": "Plano Semanal", "amount": 10.90, "duration_days": 7},
     "monthly": {"label": "Plano Mensal", "amount": 15.90, "duration_days": 30},
@@ -118,7 +115,6 @@ def db_init():
     )
     conn.commit()
 
-    # Migração segura (caso você já tenha o DB antigo sem as novas colunas)
     if not _column_exists(cur, "users", "pix_copia_cola"):
         cur.execute("ALTER TABLE users ADD COLUMN pix_copia_cola TEXT")
     if not _column_exists(cur, "users", "pix_ticket_url"):
@@ -229,7 +225,6 @@ def within_renewal_window(user_row) -> bool:
     return 0 < remaining <= RENEWAL_WINDOW_SECONDS
 
 async def safe_remove_from_group(context: ContextTypes.DEFAULT_TYPE, telegram_id: int):
-    """Remove usuário do grupo (kick) e libera para entrar de novo (unban)."""
     if not TELEGRAM_GROUP_ID:
         return
     try:
@@ -239,7 +234,6 @@ async def safe_remove_from_group(context: ContextTypes.DEFAULT_TYPE, telegram_id
         logger.warning(f"Falha ao remover do grupo: {e}")
 
 async def enforce_expiration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sem scheduler: checa expiração sempre que o usuário interage."""
     if not update.effective_user:
         return
     tid = update.effective_user.id
@@ -264,29 +258,20 @@ async def enforce_expiration(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 pass
 
 def pix_action_keyboard(payment_id: str, ticket_url: str) -> InlineKeyboardMarkup:
-    """
-    Botões:
-    - Copiar Pix: reenvia o copia-e-cola (mensagem limpa)
-    - Já paguei: verifica status no MP e libera se aprovado
-    - Abrir QR: abre link do QR
-    - Suporte: link direto
-    """
     row1 = [
         InlineKeyboardButton("📋 Copiar Pix", callback_data=f"pixcopy:{payment_id}"),
         InlineKeyboardButton("✅ Já paguei", callback_data=f"pixcheck:{payment_id}"),
     ]
-
     row2 = []
     if ticket_url:
         row2.append(InlineKeyboardButton("🌐 Abrir QR Code", url=ticket_url))
     if SUPPORT_URL:
         row2.append(InlineKeyboardButton("🆘 Suporte", url=SUPPORT_URL))
 
-    keyboard = [row1]
+    kb = [row1]
     if row2:
-        keyboard.append(row2)
-
-    return InlineKeyboardMarkup(keyboard)
+        kb.append(row2)
+    return InlineKeyboardMarkup(kb)
 
 # ----------------------------
 # Menus
@@ -346,9 +331,8 @@ def mp_create_pix_payment(amount: float, description: str, payer_email: str):
         "payer": {"email": payer_email},
     }
 
-    idem = str(uuid.uuid4())
     headers = mp_headers()
-    headers["X-Idempotency-Key"] = idem
+    headers["X-Idempotency-Key"] = str(uuid.uuid4())
 
     r = requests.post(
         "https://api.mercadopago.com/v1/payments",
@@ -378,7 +362,7 @@ def mp_get_payment(payment_id: str):
     return r.json()
 
 # ----------------------------
-# TEST MODE (simulação realista)
+# TEST MODE
 # ----------------------------
 def test_generate_pix_like(amount: float, description: str):
     fake_payment_id = f"TEST-{uuid.uuid4().hex[:10]}"
@@ -400,14 +384,14 @@ def test_generate_pix_like(amount: float, description: str):
     return {"id": fake_payment_id, "copia_cola": copia, "ticket_url": ticket_url, "raw": {"test": True, "description": description}}
 
 # ----------------------------
-# Ações pós-aprovação
+# Pós aprovação
 # ----------------------------
 async def grant_access(context: ContextTypes.DEFAULT_TYPE, tid: int):
     if GROUP_INVITE_LINK:
         await context.bot.send_message(
             chat_id=tid,
             text=f"✅ Pagamento confirmado!\n\n🔗 Acesse o grupo privado: {GROUP_INVITE_LINK}",
-            disable_web_page_preview=True
+            disable_web_page_preview=True,
         )
     else:
         await context.bot.send_message(
@@ -470,32 +454,26 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     await query.answer()
 
-    user = query.from_user
-    tid = user.id
-
+    tid = query.from_user.id
     data = query.data or ""
     mode, key = data.split(":", 1)
 
-    if mode not in ("buy", "renew"):
-        return
-
     row = get_user(tid)
+
     if mode == "renew":
         if not within_renewal_window(row):
-            await query.edit_message_text(
-                "⚠️ O menu de renovação só fica disponível nas últimas 24 horas da assinatura.\n\nUse /start para ver as opções corretas."
-            )
+            await query.edit_message_text("⚠️ Renovação só nas últimas 24 horas. Use /start.")
             return
         plan = PLANS_RENEWAL.get(key)
         if not plan:
-            await query.edit_message_text("Opção inválida. Use /start novamente.")
+            await query.edit_message_text("Opção inválida. Use /start.")
             return
         plan_key = key
         description = f"Renovação - {plan['label']}"
     else:
         plan = PLANS_INITIAL.get(key)
         if not plan:
-            await query.edit_message_text("Opção inválida. Use /start novamente.")
+            await query.edit_message_text("Opção inválida. Use /start.")
             return
         plan_key = key
         description = f"Assinatura - {plan['label']}"
@@ -503,9 +481,8 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     amount = float(plan["amount"])
     label = plan["label"]
 
-    await query.edit_message_text(
-        f"⏳ Gerando seu PIX...\n\nPlano: {label}\nValor: R${amount:.2f}".replace(".", ",")
-    )
+    # Sem parse_mode aqui para nunca quebrar
+    await query.edit_message_text(f"⏳ Gerando seu PIX...\n\nPlano: {label}\nValor: R${amount:.2f}".replace(".", ","))
 
     payer_email = MP_PAYER_EMAIL_PADRAO or "cliente@example.com"
 
@@ -530,31 +507,26 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             pix_ticket_url=ticket_url,
         )
 
-        extra_test = ""
-        if TEST_MODE:
-            extra_test = (
-                "\n\n🧪 *MODO TESTE ATIVO*\n"
-                "Este PIX é uma simulação. Para aprovar sem pagar, envie:\n"
-                "`/aprovar_teste`\n"
-            )
-
+        # Mensagem em HTML (não quebra com link/underscore)
         msg = (
-            "✅ *PIX GERADO COM SUCESSO!*\n\n"
-            f"Plano: *{label}*\n"
-            f"Valor: *R${amount:.2f}*\n\n"
-            "📋 *Copia e cola:*\n"
-            f"`{copia_cola}`\n\n"
+            "✅ <b>PIX GERADO COM SUCESSO!</b>\n\n"
+            f"Plano: <b>{html.escape(label)}</b>\n"
+            f"Valor: <b>R${amount:.2f}</b>\n\n"
+            "📋 <b>Copia e cola:</b>\n"
+            f"<code>{html.escape(copia_cola)}</code>\n\n"
         )
         if ticket_url:
-            msg += f"🔗 *QR Code:* {ticket_url}\n\n"
+            msg += f"🔗 <b>QR Code:</b> {html.escape(ticket_url)}\n\n"
 
         msg += "⬇️ Use os botões abaixo para copiar ou confirmar o pagamento."
-        msg += extra_test
+
+        if TEST_MODE:
+            msg += "\n\n🧪 <b>MODO TESTE ATIVO</b>\nPara aprovar sem pagar, envie: <code>/aprovar_teste</code>"
 
         await context.bot.send_message(
             chat_id=tid,
             text=msg,
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
             reply_markup=pix_action_keyboard(payment_id, ticket_url),
         )
@@ -564,10 +536,7 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         clear_pending(tid)
         await context.bot.send_message(
             chat_id=tid,
-            text=(
-                "❌ Não consegui gerar o PIX agora.\n\n"
-                "Tente novamente em instantes com /start."
-            ),
+            text="❌ Não consegui gerar o PIX agora.\n\nTente novamente em instantes com /start.",
         )
 
 async def pix_copy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -576,20 +545,19 @@ async def pix_copy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer()
 
-    data = query.data or ""
-    _, payment_id = data.split(":", 1)
-
+    _, payment_id = (query.data or "").split(":", 1)
     row = get_user_by_payment_id(payment_id)
+
     if not row or not row["pix_copia_cola"]:
         await query.message.reply_text("❌ Não encontrei esse PIX. Gere um novo com /start.")
         return
 
     pix = row["pix_copia_cola"].strip()
     await query.message.reply_text(
-        "📋 *Pix Copia e Cola*\n"
-        "_(toque e segure para copiar)_\n\n"
-        f"`{pix}`",
-        parse_mode=ParseMode.MARKDOWN
+        "📋 <b>Pix Copia e Cola</b>\n"
+        "<i>(toque e segure para copiar)</i>\n\n"
+        f"<code>{html.escape(pix)}</code>",
+        parse_mode=ParseMode.HTML,
     )
 
 async def pix_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -598,9 +566,7 @@ async def pix_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     await query.answer("Verificando...")
 
-    data = query.data or ""
-    _, payment_id = data.split(":", 1)
-
+    _, payment_id = (query.data or "").split(":", 1)
     row = get_user_by_payment_id(payment_id)
     if not row:
         await query.message.reply_text("❌ Não encontrei esse pagamento. Gere um novo com /start.")
@@ -608,7 +574,6 @@ async def pix_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     tid = int(row["telegram_id"])
 
-    # TEST_MODE: pode orientar ou aprovar automaticamente
     if TEST_MODE:
         await query.message.reply_text("🧪 Modo teste: para aprovar, envie /aprovar_teste.")
         return
@@ -632,15 +597,11 @@ async def pix_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             duration_days = 7
             label = "Plano"
 
-        # ativa e libera
         set_active(tid, plan_key, duration_days)
         await safe_remove_from_group(context, tid)
         await grant_access(context, tid)
 
-        await query.message.reply_text(
-            f"✅ Pagamento confirmado!\nPlano: {label}\n\nAcesso liberado ✅",
-            disable_web_page_preview=True
-        )
+        await query.message.reply_text(f"✅ Pagamento confirmado!\nPlano: {label}\n\nAcesso liberado ✅")
         return
 
     if status in ("pending", "in_process"):
@@ -650,12 +611,10 @@ async def pix_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    # outros status: rejected/cancelled/refunded/charged_back etc.
     upsert_user(tid, payment_status=status)
     await query.message.reply_text(f"❌ Pagamento não aprovado (status: {status}). Gere um novo PIX com /start.")
 
 async def aprovar_teste(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Aprova o pagamento pendente no modo TESTE, sem MP."""
     await enforce_expiration(update, context)
 
     user = update.effective_user
@@ -689,9 +648,7 @@ async def aprovar_teste(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await grant_access(context, tid)
 
     await update.message.reply_text(
-        f"✅ *PAGAMENTO APROVADO (TESTE)*\n\nPlano: *{label}*\nValidade: *{duration_days} dias*\n\nAcesso liberado ✅",
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True
+        f"✅ PAGAMENTO APROVADO (TESTE)\nPlano: {label}\nValidade: {duration_days} dias\n\nAcesso liberado ✅"
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -770,9 +727,6 @@ class MPWebhookHandler(BaseHTTPRequestHandler):
                     duration_days = 7
 
                 set_active(tid, plan_key, duration_days)
-                # libera acesso
-                # como estamos fora do loop async, só marcamos no DB.
-                # o usuário pode tocar em "Já paguei" ou /start para receber o link.
                 upsert_user(tid, payment_status="approved")
             else:
                 upsert_user(tid, payment_status=status)
@@ -783,7 +737,7 @@ class MPWebhookHandler(BaseHTTPRequestHandler):
             logger.exception("Erro no webhook MP")
             return self._send(500, "error")
 
-def start_webhook_server(application: Application):
+def start_webhook_server():
     if not MP_WEBHOOK_URL:
         logger.info("MP_WEBHOOK_URL não configurada — webhook não será iniciado.")
         return
@@ -798,7 +752,7 @@ def start_webhook_server(application: Application):
     th.start()
 
 # ----------------------------
-# Fallback: qualquer texto
+# Fallback
 # ----------------------------
 async def any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await enforce_expiration(update, context)
@@ -831,7 +785,7 @@ def main():
             logger.info("Webhook protegido por token. Garanta que a URL do MP tenha ?token=SEU_SEGREDO")
         else:
             logger.warning("Webhook sem token (MP_WEBHOOK_SECRET vazio). Recomendo configurar.")
-        start_webhook_server(application)
+        start_webhook_server()
 
     logger.info(f"Bot iniciado. TEST_MODE={TEST_MODE}")
     application.run_polling(close_loop=False)
